@@ -17,7 +17,7 @@ const app = express();
 
 // [VERCEL-REMOVE]: port variable та remove করুন - Vercel নিজে port manage করে
 // [LOCAL-KEEP]: Local এ রাখুন
-const port: number = Number(process.env.PORT) || 5000;
+// const port: number = Number(process.env.PORT) || 5000;
 
 app.use(
     cors({
@@ -955,25 +955,25 @@ async function run(): Promise<void> {
 
     // [VERCEL-REMOVE]: run() এর closing brace এবং catch block remove করুন
     // [LOCAL-KEEP]: Local এ রাখুন
-    } catch (error) {
-        console.error("❌ MongoDB connection error:", error);
-        process.exit(1);
-    }
-}
+//     } catch (error) {
+//         console.error("❌ MongoDB connection error:", error);
+//         process.exit(1);
+//     }
+// }
 
 // [VERCEL-REMOVE]: এই line টা remove করুন
 // [LOCAL-KEEP]: Local এ রাখুন
-run().catch(console.dir);
+// run().catch(console.dir);
 
-app.get("/", (_req: Request, res: Response) => {
-    res.send("🏡 StayEase Server is Running!");
-});
+// app.get("/", (_req: Request, res: Response) => {
+//     res.send("🏡 StayEase Server is Running!");
+// });
 
 // [VERCEL-REMOVE]: এই পুরো app.listen() block টা remove করুন
 // [LOCAL-KEEP]: Local এ রাখুন
-app.listen(port, () => {
-    console.log(`🚀 Server running on port ${port}`);
-});
+// app.listen(port, () => {
+//     console.log(`🚀 Server running on port ${port}`);
+// });
 
 // [VERCEL-ADD]: File এর একদম শেষে এই line add করুন
 // [LOCAL-SKIP]: Local এ লাগবে না
