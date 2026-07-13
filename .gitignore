@@ -1,2 +1,8 @@
+# Environment
 .env
-/node_modules
+
+# Dependencies
+node_modules/
+
+# Vercel
+.vercel/
