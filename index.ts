@@ -29,17 +29,22 @@ const uri: string = process.env.MONGODB_URI || "";
 const dbName: string = process.env.DB_NAME || "StayEase";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
-if (!uri) {
-    throw new Error("MONGODB_URI environment variable is not set");
-}
-
-let clientPromise: Promise<MongoClient>;
+// ✅ throw এর পরিবর্তে graceful error - Vercel এ throw করলে function crash হয়
+let clientPromise: Promise<MongoClient> | null = null;
 
 const globalWithMongo = global as typeof globalThis & {
     _mongoClientPromise?: Promise<MongoClient>;
 };
 
-if (!globalWithMongo._mongoClientPromise) {
+function getClientPromise(): Promise<MongoClient> {
+    if (!uri) {
+        throw new Error("MONGODB_URI environment variable is not set");
+    }
+
+    if (globalWithMongo._mongoClientPromise) {
+        return globalWithMongo._mongoClientPromise;
+    }
+
     const client = new MongoClient(uri, {
         serverApi: {
             version: ServerApiVersion.v1,
@@ -47,12 +52,13 @@ if (!globalWithMongo._mongoClientPromise) {
             deprecationErrors: true,
         },
     });
+
     globalWithMongo._mongoClientPromise = client.connect();
+    return globalWithMongo._mongoClientPromise;
 }
-clientPromise = globalWithMongo._mongoClientPromise;
 
 async function getDb() {
-    const c = await clientPromise;
+    const c = await getClientPromise();
     return c.db(dbName);
 }
 
@@ -80,7 +86,15 @@ interface AuthRequest extends Request {
     jwtPayload?: JwtPayload;
 }
 
-const JWKS = createRemoteJWKSet(new URL(`${FRONTEND_URL}/api/auth/jwks`));
+// ✅ JWKS lazy initialize - throw error prevent করবে
+let JWKS: ReturnType<typeof createRemoteJWKSet> | null = null;
+
+function getJWKS() {
+    if (!JWKS) {
+        JWKS = createRemoteJWKSet(new URL(`${FRONTEND_URL}/api/auth/jwks`));
+    }
+    return JWKS;
+}
 
 function userIdFilter(id: ObjectId): Filter<Document> {
     return { _id: id } as Filter<Document>;
@@ -148,7 +162,7 @@ const verifyToken = async (
     }
 
     try {
-        const { payload } = await jwtVerify(token, JWKS);
+        const { payload } = await jwtVerify(token, getJWKS());
         const jwtPayload = payload as JwtPayload;
 
         if (!jwtPayload.sub) {
@@ -208,8 +222,38 @@ const verifyAdmin = (
     next();
 };
 
+// ✅ Health check route - এটা প্রথম test করে দেখুন
 app.get("/", (_req: Request, res: Response) => {
-    res.send("🏡 StayEase Server is Running!");
+    res.status(200).json({
+        success: true,
+        message: "🏡 StayEase Server is Running!",
+        env: {
+            hasMongoUri: !!process.env.MONGODB_URI,
+            hasDbName: !!process.env.DB_NAME,
+            hasFrontendUrl: !!process.env.FRONTEND_URL,
+            nodeEnv: process.env.NODE_ENV || "not set",
+        },
+    });
+});
+
+// ✅ MongoDB connection test route
+app.get("/api/health", async (_req: Request, res: Response) => {
+    try {
+        const db = await getDb();
+        await db.command({ ping: 1 });
+        res.status(200).json({
+            success: true,
+            message: "MongoDB connection successful!",
+            database: dbName,
+        });
+    } catch (error) {
+        console.error("Health check error:", error);
+        res.status(500).json({
+            success: false,
+            message: "MongoDB connection failed",
+            error: error instanceof Error ? error.message : "Unknown error",
+        });
+    }
 });
 
 app.get(
@@ -912,7 +956,17 @@ app.delete(
     },
 );
 
-// Local development এর জন্য
+// ✅ Global error handler - কোনো unhandled error catch করবে
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+    console.error("Unhandled error:", err);
+    res.status(500).json({
+        success: false,
+        message: "Internal server error",
+        error: process.env.NODE_ENV === "production" ? undefined : err.message,
+    });
+});
+
+// ✅ Local development এর জন্য
 if (process.env.NODE_ENV !== "production") {
     const port = Number(process.env.PORT) || 5000;
     app.listen(port, () => {
@@ -920,5 +974,5 @@ if (process.env.NODE_ENV !== "production") {
     });
 }
 
-// Vercel এর জন্য এই export টা দরকার
+// ✅ Vercel এর জন্য
 export default app;
