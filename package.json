@@ -1,12 +1,12 @@
 {
-    "name": "stayease-backend",
+    "name": "auraspace-backend",
     "version": "1.0.0",
     "description": "",
-    "main": "api/index.ts",
+    "main": "index.ts",
     "scripts": {
         "dev": "ts-node-dev --respawn --transpile-only ./index.ts",
         "build": "tsc",
-        "start": "node dist/api/index.js",
+        "start": "node dist/index.js",
         "vercel-build": "tsc"
     },
     "keywords": [],
