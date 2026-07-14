@@ -18,6 +18,7 @@ import {
     UploadApiErrorResponse,
 } from "cloudinary";
 import { Readable } from "stream";
+import Stripe from "stripe";
 
 dotenv.config();
 
@@ -32,6 +33,10 @@ app.use(
         allowedHeaders: ["Content-Type", "Authorization"],
     }),
 );
+
+// Stripe webhook MUST use raw body — register BEFORE express.json()
+app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), stripeWebhookHandler);
+
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
@@ -48,6 +53,133 @@ cloudinary.config({
     api_key: process.env.CLOUDINARY_API_KEY || "",
     api_secret: process.env.CLOUDINARY_API_SECRET || "",
 });
+
+// ============================================================
+// STRIPE CONFIG
+// ============================================================
+
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const stripe = STRIPE_SECRET_KEY
+    ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2025-12-01" as any })
+    : null;
+
+// Stripe webhook handler — defined here so it's hoisted for route registration before express.json()
+async function stripeWebhookHandler(req: Request, res: Response): Promise<void> {
+    if (!stripe) {
+        res.status(503).json({ success: false, message: "Stripe not configured." });
+        return;
+    }
+    const sig = req.headers["stripe-signature"] as string;
+
+    let event: Stripe.Event;
+    try {
+        event = stripe.webhooks.constructEvent(
+            req.body,
+            sig,
+            process.env.STRIPE_WEBHOOK_SECRET || "",
+        );
+    } catch (err: any) {
+        console.error("Webhook signature verification failed:", err.message);
+        res.status(400).json({ success: false, message: `Webhook Error: ${err.message}` });
+        return;
+    }
+
+    try {
+        const db = await getDb();
+        const bookingsCol = db.collection("bookings");
+        const transactionsCol = db.collection("transactions");
+
+        switch (event.type) {
+            case "checkout.session.completed": {
+                const session = event.data.object as Stripe.Checkout.Session;
+                const bookingId = session.metadata?.bookingId;
+
+                if (!bookingId) {
+                    console.warn("Webhook: No bookingId in session metadata");
+                    res.status(200).json({ received: true });
+                    return;
+                }
+
+                const objectId = toObjectId(parseId(bookingId));
+                if (!objectId) {
+                    console.warn("Webhook: Invalid bookingId:", bookingId);
+                    res.status(200).json({ received: true });
+                    return;
+                }
+
+                const booking = await bookingsCol.findOne({ _id: objectId }) as any;
+                if (!booking) {
+                    console.warn("Webhook: Booking not found:", bookingId);
+                    res.status(200).json({ received: true });
+                    return;
+                }
+
+                // Idempotency check — prevent duplicate webhook processing
+                const idempotencyKey = `stripe_${session.id}`;
+                const existingTxn = await transactionsCol.findOne({ transactionId: idempotencyKey });
+                if (existingTxn) {
+                    console.log(`Webhook: Session ${session.id} already processed, skipping`);
+                    res.status(200).json({ received: true });
+                    return;
+                }
+
+                await bookingsCol.updateOne(
+                    { _id: objectId },
+                    { $set: { status: "confirmed", updatedAt: new Date() } },
+                );
+
+                const txnId = idempotencyKey;
+                await transactionsCol.insertOne({
+                    userId: booking.guestId,
+                    bookingId,
+                    type: "payment" as const,
+                    amount: booking.totalAmount,
+                    currency: (session.currency || process.env.STRIPE_CURRENCY || "usd").toUpperCase(),
+                    method: "card" as const,
+                    status: "success" as const,
+                    transactionId: txnId,
+                    description: `Payment for booking at ${booking.propertyTitle}`,
+                    createdAt: new Date(),
+                });
+
+                console.log(`✅ Booking ${bookingId} confirmed via Stripe webhook (session: ${session.id})`);
+                break;
+            }
+
+            case "checkout.session.expired": {
+                const session = event.data.object as Stripe.Checkout.Session;
+                const bookingId = session.metadata?.bookingId;
+
+                if (bookingId) {
+                    const objectId = toObjectId(parseId(bookingId));
+                    if (objectId) {
+                        await bookingsCol.updateOne(
+                            { _id: objectId, status: "pending" },
+                            {
+                                $set: {
+                                    status: "cancelled",
+                                    cancelledBy: "guest" as const,
+                                    cancellationReason: "Payment session expired",
+                                    updatedAt: new Date(),
+                                },
+                            },
+                        );
+                        console.log(`Booking ${bookingId} cancelled due to expired payment session`);
+                    }
+                }
+                break;
+            }
+
+            default:
+                console.log(`Unhandled event type: ${event.type}`);
+        }
+
+        res.status(200).json({ received: true });
+    } catch (error) {
+        console.error("Webhook handler error:", error);
+        res.status(200).json({ received: true });
+    }
+}
 
 // ============================================================
 // MULTER CONFIG - memory storage (buffer → Cloudinary)
@@ -180,6 +312,73 @@ interface PropertyDoc {
     isFeatured: boolean;
     rejectionReason?: string;
     deletedAt?: Date;
+    createdAt: Date;
+    updatedAt: Date;
+}
+
+// ============================================================
+// PAYOUT METHOD (host bank details for manual payouts)
+// ============================================================
+
+interface PayoutMethodDoc {
+    _id?: ObjectId;
+    userId: string;
+    accountHolder: string;
+    bankName: string;
+    accountNumber: string;
+    routingNumber: string;
+    swiftCode: string;
+    bankAddress?: string;
+    createdAt: Date;
+    updatedAt: Date;
+}
+
+// ============================================================
+// TRANSACTION
+// ============================================================
+
+type TransactionType = "payment" | "payout" | "refund" | "commission";
+type TransactionStatusType = "pending" | "success" | "failed" | "refunded";
+
+interface TransactionDoc {
+    _id?: ObjectId;
+    userId: string;
+    bookingId: string;
+    type: TransactionType;
+    amount: number;
+    currency: string;
+    method: "card" | "paypal" | "bkash" | "bank";
+    status: TransactionStatusType;
+    transactionId: string;
+    description?: string;
+    createdAt: Date;
+}
+
+// ============================================================
+// BOOKING
+// ============================================================
+
+type BookingStatus = "pending" | "confirmed" | "cancelled" | "completed";
+
+interface BookingDoc {
+    _id?: ObjectId;
+    guestId: string;
+    hostId: string;
+    propertyId: string;
+    propertyTitle: string;
+    propertyImage: string;
+    checkIn: Date;
+    checkOut: Date;
+    numberOfGuests: number;
+    numberOfNights: number;
+    pricePerNight: number;
+    totalAmount: number;
+    platformFee: number;
+    hostEarning: number;
+    status: BookingStatus;
+    specialRequest?: string;
+    cancelledBy?: "guest" | "host" | "admin";
+    cancellationReason?: string;
     createdAt: Date;
     updatedAt: Date;
 }
@@ -348,6 +547,119 @@ ensureUserIndexes().catch((err) =>
     console.error("❌ Failed to create user indexes:", err),
 );
 
+// Payout methods indexes
+async function ensurePayoutMethodIndexes() {
+    try {
+        const db = await getDb();
+        const col = db.collection("payout_methods");
+        await col.createIndex({ userId: 1 }, { unique: true });
+        console.log("✅ Payout method indexes created");
+    } catch (error) {
+        console.warn("⚠️ Payout method index creation warning:", error);
+    }
+}
+
+ensurePayoutMethodIndexes().catch((err) =>
+    console.error("❌ Failed to create payout method indexes:", err),
+);
+
+// Booking indexes
+async function ensureBookingIndexes() {
+    try {
+        const db = await getDb();
+        const col = db.collection("bookings");
+        await col.createIndex({ guestId: 1, status: 1 });
+        await col.createIndex({ hostId: 1, status: 1 });
+        await col.createIndex({ propertyId: 1, status: 1 });
+        await col.createIndex({ propertyId: 1, checkIn: 1, checkOut: 1 });
+        await col.createIndex({ status: 1, createdAt: -1 });
+        console.log("✅ Booking indexes created");
+    } catch (error) {
+        console.warn("⚠️ Booking index creation warning:", error);
+    }
+}
+
+ensureBookingIndexes().catch((err) =>
+    console.error("❌ Failed to create booking indexes:", err),
+);
+
+// Transaction indexes
+async function ensureTransactionIndexes() {
+    try {
+        const db = await getDb();
+        const col = db.collection("transactions");
+        await col.createIndex({ userId: 1, createdAt: -1 });
+        await col.createIndex({ bookingId: 1 });
+        await col.createIndex({ status: 1 });
+        await col.createIndex({ transactionId: 1 }, { unique: true });
+        await col.createIndex({ type: 1, status: 1 });
+        console.log("✅ Transaction indexes created");
+    } catch (error) {
+        console.warn("⚠️ Transaction index creation warning:", error);
+    }
+}
+
+ensureTransactionIndexes().catch((err) =>
+    console.error("❌ Failed to create transaction indexes:", err),
+);
+
+// Wishlist indexes
+async function ensureWishlistIndexes() {
+    try {
+        const db = await getDb();
+        const col = db.collection("wishlist");
+        await col.createIndex({ userId: 1, propertyId: 1 }, { unique: true });
+        await col.createIndex({ userId: 1, listName: 1 });
+        console.log("✅ Wishlist indexes created");
+    } catch (error) {
+        console.warn("⚠️ Wishlist index creation warning:", error);
+    }
+}
+
+ensureWishlistIndexes().catch((err) =>
+    console.error("❌ Failed to create wishlist indexes:", err),
+);
+
+// Review indexes
+async function ensureReviewIndexes() {
+    try {
+        const db = await getDb();
+        const col = db.collection("reviews");
+        await col.createIndex({ propertyId: 1, createdAt: -1 });
+        await col.createIndex({ guestId: 1 });
+        await col.createIndex({ hostId: 1 });
+        await col.createIndex({ bookingId: 1 }, { unique: true });
+        await col.createIndex({ isReported: 1 });
+        console.log("✅ Review indexes created");
+    } catch (error) {
+        console.warn("⚠️ Review index creation warning:", error);
+    }
+}
+
+ensureReviewIndexes().catch((err) =>
+    console.error("❌ Failed to create review indexes:", err),
+);
+
+// Message indexes
+async function ensureMessageIndexes() {
+    try {
+        const db = await getDb();
+        const conversationsCol = db.collection("conversations");
+        await conversationsCol.createIndex({ participants: 1 });
+        await conversationsCol.createIndex({ participants: 1, lastMessageAt: -1 });
+        const messagesCol = db.collection("messages");
+        await messagesCol.createIndex({ conversationId: 1, createdAt: 1 });
+        await messagesCol.createIndex({ conversationId: 1, isRead: 1 });
+        console.log("✅ Message indexes created");
+    } catch (error) {
+        console.warn("⚠️ Message index creation warning:", error);
+    }
+}
+
+ensureMessageIndexes().catch((err) =>
+    console.error("❌ Failed to create message indexes:", err),
+);
+
 // ============================================================
 // HELPERS
 // ============================================================
@@ -405,6 +717,34 @@ async function findUserById(
     } catch {}
 
     return null;
+}
+
+// Batch user lookup — replaces N+1 pattern
+async function findUsersMap(
+    usersCol: any,
+    userIds: string[],
+): Promise<Map<string, any>> {
+    const uniqueIds = [...new Set(userIds.map((id) => String(id).trim()))].filter(Boolean);
+    if (uniqueIds.length === 0) return new Map();
+
+    const objectIds = uniqueIds
+        .filter((id) => ObjectId.isValid(id) && id.length === 24)
+        .map((id) => new ObjectId(id));
+    const stringIds = uniqueIds.filter(
+        (id) => !ObjectId.isValid(id) || id.length !== 24,
+    );
+
+    const conditions: any[] = [];
+    if (objectIds.length > 0) conditions.push({ _id: { $in: objectIds } });
+    if (stringIds.length > 0) conditions.push({ _id: { $in: stringIds } });
+
+    if (conditions.length === 0) return new Map();
+
+    const users = await usersCol
+        .find({ $or: conditions } as Filter<Document>)
+        .toArray();
+
+    return new Map(users.map((u: any) => [toIdString(u._id), u]));
 }
 
 function checkPassword(pw: string): string | null {
@@ -485,6 +825,103 @@ async function deleteFromCloudinary(imageUrl: string): Promise<void> {
     } catch (err) {
         console.warn("Cloudinary delete warning:", err); // non-critical
     }
+}
+
+// ============================================================
+// WISHLIST
+// ============================================================
+
+interface WishlistDoc {
+    _id?: ObjectId;
+    userId: string;
+    propertyId: string;
+    listName?: string;
+    createdAt: Date;
+}
+
+// ============================================================
+// REVIEW
+// ============================================================
+
+interface ReviewDoc {
+    _id?: ObjectId;
+    guestId: string;
+    hostId: string;
+    propertyId: string;
+    bookingId: string;
+    rating: number;
+    comment: string;
+    hostReply?: string;
+    hostReplyDate?: Date;
+    isReported?: boolean;
+    createdAt: Date;
+}
+
+// ============================================================
+// MESSAGE
+// ============================================================
+
+interface ConversationDoc {
+    _id?: ObjectId;
+    participants: string[];
+    bookingId?: string;
+    propertyId?: string;
+    lastMessage?: string;
+    lastMessageAt?: Date;
+    createdAt: Date;
+    updatedAt: Date;
+}
+
+interface MessageDoc {
+    _id?: ObjectId;
+    conversationId: string;
+    senderId: string;
+    content: string;
+    isRead: boolean;
+    createdAt: Date;
+}
+
+// ============================================================
+// BOOKING HELPERS
+// ============================================================
+
+function calculateNights(checkIn: Date, checkOut: Date): number {
+    const diff = checkOut.getTime() - checkIn.getTime();
+    return Math.max(1, Math.round(diff / (1000 * 60 * 60 * 24)));
+}
+
+function calculateFees(totalAmount: number): {
+    platformFee: number;
+    hostEarning: number;
+} {
+    const feePercent = Math.min(100, Math.max(0, Number(process.env.PLATFORM_FEE_PERCENT) || 10));
+    const platformFee = Math.round(totalAmount * (feePercent / 100) * 100) / 100;
+    const hostEarning = Math.round((totalAmount - platformFee) * 100) / 100;
+    return { platformFee, hostEarning };
+}
+
+async function checkDateOverlap(
+    bookingsCol: any,
+    propertyId: string,
+    checkIn: Date,
+    checkOut: Date,
+    excludeBookingId?: string,
+): Promise<boolean> {
+    const filter: Record<string, any> = {
+        propertyId,
+        status: { $in: ["pending", "confirmed"] },
+        $or: [
+            { checkIn: { $lt: checkOut, $gte: checkIn } },
+            { checkOut: { $gt: checkIn, $lte: checkOut } },
+            { checkIn: { $lte: checkIn }, checkOut: { $gte: checkOut } },
+        ],
+    };
+    if (excludeBookingId) {
+        const excludeOid = toObjectId(excludeBookingId);
+        if (excludeOid) filter._id = { $ne: excludeOid };
+    }
+    const count = await bookingsCol.countDocuments(filter);
+    return count > 0;
 }
 
 // ============================================================
@@ -3320,6 +3757,2189 @@ app.delete(
                 success: false,
                 message: "Failed to delete property.",
             });
+        }
+    },
+);
+
+// ============================================================
+// BOOKING ROUTES
+// ============================================================
+
+// POST create booking (guest)
+app.post(
+    "/api/bookings",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const user = req.user!;
+            if (user.role !== "guest" && user.role !== "admin") {
+                res.status(403).json({
+                    success: false,
+                    message: "Only guests can create bookings.",
+                });
+                return;
+            }
+
+            const { propertyId, checkIn, checkOut, numberOfGuests, specialRequest } = req.body;
+
+            if (!propertyId || !checkIn || !checkOut || !numberOfGuests) {
+                res.status(400).json({
+                    success: false,
+                    message: "propertyId, checkIn, checkOut, numberOfGuests are required.",
+                });
+                return;
+            }
+
+            const checkInDate = new Date(checkIn);
+            const checkOutDate = new Date(checkOut);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+
+            if (checkInDate < today) {
+                res.status(400).json({ success: false, message: "Check-in cannot be in the past." });
+                return;
+            }
+            if (checkOutDate <= checkInDate) {
+                res.status(400).json({ success: false, message: "Check-out must be after check-in." });
+                return;
+            }
+
+            const db = await getDb();
+            const propertiesCol = db.collection("properties");
+            const bookingsCol = db.collection("bookings");
+
+            const propertyOid = toObjectId(parseId(propertyId));
+            if (!propertyOid) {
+                res.status(400).json({ success: false, message: "Invalid property ID." });
+                return;
+            }
+            const property = await propertiesCol.findOne({
+                _id: propertyOid,
+                status: "active",
+            });
+            if (!property) {
+                res.status(404).json({ success: false, message: "Property not found or not active." });
+                return;
+            }
+
+            if (numberOfGuests > (property.details?.maxGuests || 99)) {
+                res.status(400).json({
+                    success: false,
+                    message: `Maximum ${property.details.maxGuests} guests allowed.`,
+                });
+                return;
+            }
+
+            const hasOverlap = await checkDateOverlap(
+                bookingsCol, propertyId, checkInDate, checkOutDate
+            );
+            if (hasOverlap) {
+                res.status(409).json({
+                    success: false,
+                    message: "This property is already booked for the selected dates.",
+                });
+                return;
+            }
+
+            const nights = calculateNights(checkInDate, checkOutDate);
+            const pricePerNight = property.price?.perNight || 0;
+            const totalAmount = Math.round(pricePerNight * nights * 100) / 100;
+            const { platformFee, hostEarning } = calculateFees(totalAmount);
+
+            const hostId = property.hostId;
+
+            const now = new Date();
+            const booking: BookingDoc = {
+                guestId: toIdString(user._id),
+                hostId,
+                propertyId,
+                propertyTitle: property.title || "",
+                propertyImage: Array.isArray(property.images) && property.images.length > 0
+                    ? property.images[0] : "",
+                checkIn: checkInDate,
+                checkOut: checkOutDate,
+                numberOfGuests: Number(numberOfGuests),
+                numberOfNights: nights,
+                pricePerNight,
+                totalAmount,
+                platformFee,
+                hostEarning,
+                status: "pending",
+                specialRequest: specialRequest || undefined,
+                createdAt: now,
+                updatedAt: now,
+            };
+
+            const result = await bookingsCol.insertOne(booking as BookingDoc);
+
+            res.status(201).json({
+                success: true,
+                message: "Booking created. Proceed to payment.",
+                data: {
+                    booking: { ...booking, _id: result.insertedId },
+                },
+            });
+        } catch (error) {
+            console.error("Create booking error:", error);
+            res.status(500).json({ success: false, message: "Failed to create booking." });
+        }
+    },
+);
+
+// GET my bookings (guest)
+app.get(
+    "/api/bookings/my-bookings",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const user = req.user!;
+            const db = await getDb();
+            const col = db.collection("bookings");
+
+            const { page, limit, skip } = getPagination(req.query, 50, 10);
+
+            const filter: Record<string, any> = { guestId: toIdString(user._id) };
+
+            if (req.query.status && ["pending", "confirmed", "cancelled", "completed"].includes(String(req.query.status))) {
+                filter.status = String(req.query.status);
+            }
+            if (req.query.search) {
+                filter.propertyTitle = { $regex: escapeRegex(String(req.query.search)), $options: "i" };
+            }
+
+            const [bookings, total] = await Promise.all([
+                col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                col.countDocuments(filter),
+            ]);
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    bookings,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch bookings." });
+        }
+    },
+);
+
+// GET host reservations
+app.get(
+    "/api/bookings/host-reservations",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const user = req.user!;
+            const db = await getDb();
+            const col = db.collection("bookings");
+
+            const { page, limit, skip } = getPagination(req.query, 50, 10);
+
+            const filter: Record<string, any> = { hostId: toIdString(user._id) };
+
+            if (req.query.status && ["pending", "confirmed", "cancelled", "completed"].includes(String(req.query.status))) {
+                filter.status = String(req.query.status);
+            }
+            if (req.query.propertyId) {
+                filter.propertyId = String(req.query.propertyId);
+            }
+
+            const [bookings, total] = await Promise.all([
+                col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                col.countDocuments(filter),
+            ]);
+
+            // Attach guest info (batched)
+            const usersCol = db.collection("user");
+            const usersMap = await findUsersMap(usersCol, (bookings as any[]).map((b: any) => b.guestId));
+            const bookingsWithGuests = (bookings as any[]).map((b: any) => {
+                const guest = usersMap.get(b.guestId);
+                return {
+                    ...b,
+                    guest: guest
+                        ? { id: toIdString(guest._id), name: guest.name, image: guest.image }
+                        : null,
+                };
+            });
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    bookings: bookingsWithGuests,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch reservations." });
+        }
+    },
+);
+
+// GET single booking detail
+app.get(
+    "/api/bookings/:id",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid booking ID." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("bookings");
+            const booking = await col.findOne({ _id: objectId }) as any;
+
+            if (!booking) {
+                res.status(404).json({ success: false, message: "Booking not found." });
+                return;
+            }
+
+            const userId = toIdString(req.user!._id);
+            const isGuest = booking.guestId === userId;
+            const isHost = booking.hostId === userId;
+            const isAdmin = req.user!.role === "admin";
+
+            if (!isGuest && !isHost && !isAdmin) {
+                res.status(403).json({ success: false, message: "Access denied." });
+                return;
+            }
+
+            // Attach guest, host, property info
+            const usersCol = db.collection("user");
+            const propertiesCol = db.collection("properties");
+
+            const [guest, host, property] = await Promise.all([
+                findUserById(usersCol, booking.guestId),
+                findUserById(usersCol, booking.hostId),
+                propertiesCol.findOne({ _id: toObjectId(parseId(booking.propertyId))! }),
+            ]);
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    ...booking,
+                    guest: guest ? { id: toIdString(guest._id), name: guest.name, image: guest.image } : null,
+                    host: host ? { id: toIdString(host._id), name: host.name, image: host.image } : null,
+                    property: property ? {
+                        id: toIdString(property._id),
+                        title: property.title,
+                        images: property.images,
+                        location: property.location,
+                        category: property.category,
+                    } : null,
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch booking." });
+        }
+    },
+);
+
+// PUT confirm booking (host)
+app.put(
+    "/api/bookings/:id/confirm",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid booking ID." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("bookings");
+            const booking = await col.findOne({ _id: objectId }) as any;
+
+            if (!booking) {
+                res.status(404).json({ success: false, message: "Booking not found." });
+                return;
+            }
+
+            const userId = toIdString(req.user!._id);
+            if (booking.hostId !== userId && req.user!.role !== "admin") {
+                res.status(403).json({ success: false, message: "You are not the host of this property." });
+                return;
+            }
+
+            if (booking.status !== "pending") {
+                res.status(400).json({ success: false, message: "Only pending bookings can be confirmed." });
+                return;
+            }
+
+            await col.updateOne(
+                { _id: objectId },
+                { $set: { status: "confirmed", updatedAt: new Date() } },
+            );
+
+            res.status(200).json({
+                success: true,
+                message: "Booking confirmed.",
+                data: { id, status: "confirmed" },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to confirm booking." });
+        }
+    },
+);
+
+// PUT cancel booking (guest/host/admin)
+app.put(
+    "/api/bookings/:id/cancel",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid booking ID." });
+                return;
+            }
+
+            const { reason } = req.body;
+
+            const db = await getDb();
+            const col = db.collection("bookings");
+            const booking = await col.findOne({ _id: objectId }) as any;
+
+            if (!booking) {
+                res.status(404).json({ success: false, message: "Booking not found." });
+                return;
+            }
+
+            const userId = toIdString(req.user!._id);
+            const isGuest = booking.guestId === userId;
+            const isHost = booking.hostId === userId;
+            const isAdmin = req.user!.role === "admin";
+
+            if (!isGuest && !isHost && !isAdmin) {
+                res.status(403).json({ success: false, message: "Access denied." });
+                return;
+            }
+
+            if (booking.status !== "pending" && booking.status !== "confirmed") {
+                res.status(400).json({ success: false, message: "Booking cannot be cancelled in its current state." });
+                return;
+            }
+
+            let cancelledBy: "guest" | "host" | "admin" = "guest";
+            if (isAdmin) cancelledBy = "admin";
+            else if (isHost) cancelledBy = "host";
+
+            await col.updateOne(
+                { _id: objectId },
+                {
+                    $set: {
+                        status: "cancelled",
+                        cancelledBy,
+                        cancellationReason: reason || undefined,
+                        updatedAt: new Date(),
+                    },
+                },
+            );
+
+            res.status(200).json({
+                success: true,
+                message: "Booking cancelled.",
+                data: { id, status: "cancelled", cancelledBy },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to cancel booking." });
+        }
+    },
+);
+
+// PUT complete booking (host)
+app.put(
+    "/api/bookings/:id/complete",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid booking ID." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("bookings");
+            const booking = await col.findOne({ _id: objectId }) as any;
+
+            if (!booking) {
+                res.status(404).json({ success: false, message: "Booking not found." });
+                return;
+            }
+
+            const userId = toIdString(req.user!._id);
+            if (booking.hostId !== userId && req.user!.role !== "admin") {
+                res.status(403).json({ success: false, message: "You are not the host of this property." });
+                return;
+            }
+
+            if (booking.status !== "confirmed") {
+                res.status(400).json({ success: false, message: "Only confirmed bookings can be completed." });
+                return;
+            }
+
+            await col.updateOne(
+                { _id: objectId },
+                { $set: { status: "completed", updatedAt: new Date() } },
+            );
+
+            res.status(200).json({
+                success: true,
+                message: "Booking marked as completed.",
+                data: { id, status: "completed" },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to complete booking." });
+        }
+    },
+);
+
+// GET admin all bookings
+app.get(
+    "/api/admin/bookings",
+    verifyToken,
+    verifyAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("bookings");
+
+            const { page, limit, skip } = getPagination(req.query, 100, 20);
+
+            const filter: Record<string, any> = {};
+
+            if (req.query.status && ["pending", "confirmed", "cancelled", "completed"].includes(String(req.query.status))) {
+                filter.status = String(req.query.status);
+            }
+            if (req.query.guestId) filter.guestId = String(req.query.guestId);
+            if (req.query.hostId) filter.hostId = String(req.query.hostId);
+            if (req.query.propertyId) filter.propertyId = String(req.query.propertyId);
+            if (req.query.search) {
+                filter.propertyTitle = { $regex: escapeRegex(String(req.query.search)), $options: "i" };
+            }
+
+            const [bookings, total] = await Promise.all([
+                col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                col.countDocuments(filter),
+            ]);
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    bookings,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch bookings." });
+        }
+    },
+);
+
+// PUT admin force cancel booking
+app.put(
+    "/api/admin/bookings/:id/force-cancel",
+    verifyToken,
+    verifyAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid booking ID." });
+                return;
+            }
+
+            const { reason } = req.body;
+
+            const db = await getDb();
+            const col = db.collection("bookings");
+            const booking = await col.findOne({ _id: objectId }) as any;
+
+            if (!booking) {
+                res.status(404).json({ success: false, message: "Booking not found." });
+                return;
+            }
+
+            await col.updateOne(
+                { _id: objectId },
+                {
+                    $set: {
+                        status: "cancelled",
+                        cancelledBy: "admin",
+                        cancellationReason: reason || "Force cancelled by admin",
+                        updatedAt: new Date(),
+                    },
+                },
+            );
+
+            res.status(200).json({
+                success: true,
+                message: "Booking force cancelled by admin.",
+                data: { id, status: "cancelled" },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to force cancel booking." });
+        }
+    },
+);
+
+// ============================================================
+// PAYOUT ROUTES (host bank details, manual payouts)
+// ============================================================
+
+// PUT save payout method (host bank details)
+app.put(
+    "/api/payments/payout-method",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const user = req.user!;
+            const { accountHolder, bankName, accountNumber, routingNumber, swiftCode, bankAddress } = req.body;
+
+            if (!accountHolder || !bankName || !accountNumber) {
+                res.status(400).json({ success: false, message: "accountHolder, bankName, accountNumber are required." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("payout_methods");
+            const userId = toIdString(user._id);
+
+            const existing = await col.findOne({ userId });
+            const now = new Date();
+            const data = {
+                userId,
+                accountHolder: String(accountHolder).trim(),
+                bankName: String(bankName).trim(),
+                accountNumber: String(accountNumber).trim(),
+                routingNumber: String(routingNumber || "").trim(),
+                swiftCode: String(swiftCode || "").trim(),
+                bankAddress: String(bankAddress || "").trim(),
+                updatedAt: now,
+            };
+
+            if (existing) {
+                await col.updateOne({ userId }, { $set: data });
+            } else {
+                await col.insertOne({ ...data, createdAt: now });
+            }
+
+            res.status(200).json({
+                success: true,
+                message: existing ? "Payout method updated." : "Payout method saved.",
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to save payout method." });
+        }
+    },
+);
+
+// GET payout method (masked)
+app.get(
+    "/api/payments/payout-method",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("payout_methods");
+            const method = await col.findOne({ userId: toIdString(req.user!._id) }) as any;
+
+            if (!method) {
+                res.status(200).json({ success: true, data: null });
+                return;
+            }
+
+            // Mask account number
+            const accNum = method.accountNumber || "";
+            const masked = accNum.length > 4
+                ? "****" + accNum.slice(-4)
+                : "****";
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    id: toIdString(method._id),
+                    accountHolder: method.accountHolder,
+                    bankName: method.bankName,
+                    accountNumber: masked,
+                    routingNumber: method.routingNumber,
+                    swiftCode: method.swiftCode,
+                    bankAddress: method.bankAddress,
+                    createdAt: method.createdAt,
+                    updatedAt: method.updatedAt,
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to get payout method." });
+        }
+    },
+);
+
+// POST request payout (host)
+app.post(
+    "/api/payments/request-payout",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const user = req.user!;
+            const { amount } = req.body;
+
+            if (!amount || amount <= 0) {
+                res.status(400).json({ success: false, message: "Valid amount is required." });
+                return;
+            }
+
+            const db = await getDb();
+            const transactionsCol = db.collection("transactions");
+            const payoutMethodsCol = db.collection("payout_methods");
+
+            // Check they have a payout method
+            const method = await payoutMethodsCol.findOne({ userId: toIdString(user._id) });
+            if (!method) {
+                res.status(400).json({ success: false, message: "Please save a payout method first." });
+                return;
+            }
+
+            // Check available balance
+            const earnings = await transactionsCol.aggregate([
+                { $match: { userId: toIdString(user._id), type: "payment", status: "success" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray();
+
+            const paidOut = await transactionsCol.aggregate([
+                { $match: { userId: toIdString(user._id), type: "payout", status: "success" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray();
+
+            const totalEarnings = (earnings[0] as any)?.total || 0;
+            const totalPaidOut = (paidOut[0] as any)?.total || 0;
+            const available = totalEarnings - totalPaidOut;
+
+            if (Number(amount) > available) {
+                res.status(400).json({
+                    success: false,
+                    message: `Insufficient balance. Available: $${available.toFixed(2)}`,
+                });
+                return;
+            }
+
+            const transactionId = `payout_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+            await transactionsCol.insertOne({
+                userId: toIdString(user._id),
+                bookingId: "",
+                type: "payout",
+                amount: Math.round(Number(amount) * 100) / 100,
+                currency: (process.env.STRIPE_CURRENCY || "usd").toUpperCase(),
+                method: "bank",
+                status: "pending",
+                transactionId,
+                description: "Payout withdrawal request",
+                createdAt: new Date(),
+            });
+
+            res.status(200).json({
+                success: true,
+                message: "Payout requested. Admin will process it shortly.",
+                data: { transactionId, amount, status: "pending" },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to request payout." });
+        }
+    },
+);
+
+// GET payout history (host)
+app.get(
+    "/api/payments/payout-history",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("transactions");
+            const { page, limit, skip } = getPagination(req.query, 50, 10);
+
+            const filter: Record<string, any> = {
+                userId: toIdString(req.user!._id),
+                type: "payout",
+            };
+
+            const [transactions, total] = await Promise.all([
+                col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                col.countDocuments(filter),
+            ]);
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    transactions,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch payout history." });
+        }
+    },
+);
+
+// ============================================================
+// TRANSACTION ROUTES
+// ============================================================
+
+// GET my transactions (guest)
+app.get(
+    "/api/transactions/my-transactions",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("transactions");
+            const { page, limit, skip } = getPagination(req.query, 50, 10);
+
+            const filter: Record<string, any> = {
+                userId: toIdString(req.user!._id),
+                type: { $in: ["payment", "refund"] },
+            };
+
+            if (req.query.status) filter.status = String(req.query.status);
+            if (req.query.method) filter.method = String(req.query.method);
+
+            const [transactions, total] = await Promise.all([
+                col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                col.countDocuments(filter),
+            ]);
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    transactions,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch transactions." });
+        }
+    },
+);
+
+// GET host transactions
+app.get(
+    "/api/transactions/host-transactions",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("transactions");
+            const { page, limit, skip } = getPagination(req.query, 50, 10);
+
+            const filter: Record<string, any> = {
+                userId: toIdString(req.user!._id),
+                type: { $in: ["payout", "commission"] },
+            };
+
+            if (req.query.status) filter.status = String(req.query.status);
+            if (req.query.type) filter.type = String(req.query.type);
+
+            const [transactions, total] = await Promise.all([
+                col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                col.countDocuments(filter),
+            ]);
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    transactions,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch host transactions." });
+        }
+    },
+);
+
+// GET single transaction
+app.get(
+    "/api/transactions/:id",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid transaction ID." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("transactions");
+            const transaction = await col.findOne({ _id: objectId });
+
+            if (!transaction) {
+                res.status(404).json({ success: false, message: "Transaction not found." });
+                return;
+            }
+
+            const userId = toIdString(req.user!._id);
+            if ((transaction as any).userId !== userId && req.user!.role !== "admin") {
+                res.status(403).json({ success: false, message: "Access denied." });
+                return;
+            }
+
+            res.status(200).json({ success: true, data: transaction });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch transaction." });
+        }
+    },
+);
+
+// POST refund (admin)
+app.post(
+    "/api/transactions/refund/:bookingId",
+    verifyToken,
+    verifyAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const bookingId = parseId(req.params.bookingId);
+
+            const db = await getDb();
+            const bookingsCol = db.collection("bookings");
+            const transactionsCol = db.collection("transactions");
+
+            const objectId = toObjectId(bookingId);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid booking ID." });
+                return;
+            }
+
+            const booking = await bookingsCol.findOne({ _id: objectId }) as any;
+            if (!booking) {
+                res.status(404).json({ success: false, message: "Booking not found." });
+                return;
+            }
+
+            // Find the original payment transaction
+            const payment = await transactionsCol.findOne({
+                bookingId,
+                type: "payment",
+                status: "success",
+            });
+
+            if (!payment) {
+                res.status(400).json({ success: false, message: "No successful payment found for this booking." });
+                return;
+            }
+
+            const refundAmount = (payment as any).amount;
+            const transactionId = `refund_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
+            await transactionsCol.insertOne({
+                userId: booking.guestId,
+                bookingId,
+                type: "refund",
+                amount: refundAmount,
+                currency: (payment as any).currency || "USD",
+                method: (payment as any).method || "card",
+                status: "success",
+                transactionId,
+                description: `Refund for booking at ${booking.propertyTitle}`,
+                createdAt: new Date(),
+            });
+
+            // Update original payment to refunded
+            await transactionsCol.updateOne(
+                { _id: payment._id },
+                { $set: { status: "refunded" } },
+            );
+
+            res.status(200).json({
+                success: true,
+                message: `Refund of $${refundAmount} processed.`,
+                data: { transactionId, amount: refundAmount },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to process refund." });
+        }
+    },
+);
+
+// GET admin all transactions
+app.get(
+    "/api/admin/transactions",
+    verifyToken,
+    verifyAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("transactions");
+            const { page, limit, skip } = getPagination(req.query, 100, 20);
+
+            const filter: Record<string, any> = {};
+
+            if (req.query.type) filter.type = String(req.query.type);
+            if (req.query.status) filter.status = String(req.query.status);
+            if (req.query.method) filter.method = String(req.query.method);
+            if (req.query.userId) filter.userId = String(req.query.userId);
+
+            const [transactions, total] = await Promise.all([
+                col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                col.countDocuments(filter),
+            ]);
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    transactions,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch transactions." });
+        }
+    },
+);
+
+// GET transaction stats
+app.get(
+    "/api/transactions/stats",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("transactions");
+            const userId = toIdString(req.user!._id);
+            const isAdmin = req.user!.role === "admin";
+
+            let matchFilter: Record<string, any> = {};
+            if (!isAdmin) {
+                matchFilter = { userId };
+            }
+
+            // Total spend (guest payments)
+            const totalSpendArr = await col.aggregate([
+                { $match: { ...matchFilter, type: "payment", status: "success" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray();
+            const totalSpend = (totalSpendArr[0] as any)?.total || 0;
+
+            // Total earned (host earnings)
+            const totalEarnArr = await col.aggregate([
+                { $match: { ...matchFilter, type: "payout", status: "success" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray();
+            const totalEarned = (totalEarnArr[0] as any)?.total || 0;
+
+            // Platform commission earned (admin only)
+            let commissionEarned = 0;
+            let pendingPayouts = 0;
+            if (isAdmin) {
+                const commissionArr = await col.aggregate([
+                    { $match: { type: "commission", status: "success" } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).toArray();
+                commissionEarned = (commissionArr[0] as any)?.total || 0;
+
+                const pendingArr = await col.aggregate([
+                    { $match: { type: "payout", status: "pending" } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).toArray();
+                pendingPayouts = (pendingArr[0] as any)?.total || 0;
+            }
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    totalSpend: Math.round(totalSpend * 100) / 100,
+                    totalEarned: Math.round(totalEarned * 100) / 100,
+                    ...(isAdmin ? {
+                        commissionEarned: Math.round(commissionEarned * 100) / 100,
+                        pendingPayouts: Math.round(pendingPayouts * 100) / 100,
+                    } : {}),
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch transaction stats." });
+        }
+    },
+);
+
+// POST admin process payout
+app.post(
+    "/api/admin/payments/process-payout",
+    verifyToken,
+    verifyAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const { transactionId } = req.body;
+
+            if (!transactionId) {
+                res.status(400).json({ success: false, message: "transactionId is required." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("transactions");
+
+            // Find by transactionId string (not _id)
+            const txn = await col.findOne({ transactionId }) as any;
+            if (!txn) {
+                res.status(404).json({ success: false, message: "Transaction not found." });
+                return;
+            }
+
+            if (txn.type !== "payout") {
+                res.status(400).json({ success: false, message: "Only payout transactions can be processed." });
+                return;
+            }
+
+            if (txn.status !== "pending") {
+                res.status(400).json({ success: false, message: "Only pending payouts can be processed." });
+                return;
+            }
+
+            await col.updateOne(
+                { _id: txn._id },
+                { $set: { status: "success" } },
+            );
+
+            res.status(200).json({
+                success: true,
+                message: "Payout processed successfully.",
+                data: { transactionId, status: "success" },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to process payout." });
+        }
+    },
+);
+
+// ============================================================
+// WISHLIST ROUTES
+// ============================================================
+
+// POST toggle wishlist
+app.post(
+    "/api/wishlist/toggle",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const { propertyId, listName } = req.body;
+            if (!propertyId) {
+                res.status(400).json({ success: false, message: "propertyId is required." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("wishlist");
+            const userId = toIdString(req.user!._id);
+
+            const existing = await col.findOne({ userId, propertyId });
+
+            if (existing) {
+                await col.deleteOne({ _id: existing._id });
+                res.status(200).json({ success: true, data: { action: "removed", propertyId } });
+            } else {
+                await col.insertOne({
+                    userId,
+                    propertyId,
+                    listName: listName || undefined,
+                    createdAt: new Date(),
+                });
+                res.status(201).json({ success: true, data: { action: "added", propertyId } });
+            }
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to toggle wishlist." });
+        }
+    },
+);
+
+// GET wishlist
+app.get(
+    "/api/wishlist",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("wishlist");
+            const propertiesCol = db.collection("properties");
+            const userId = toIdString(req.user!._id);
+
+            const { page, limit, skip } = getPagination(req.query, 50, 12);
+
+            const filter: Record<string, any> = { userId };
+            if (req.query.listName) filter.listName = String(req.query.listName);
+
+            const [items, total] = await Promise.all([
+                col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                col.countDocuments(filter),
+            ]);
+
+            // Join property data (batched)
+            const propIds = (items as any[]).map((i: any) => parseId(i.propertyId)).filter((id): id is string => id !== null);
+            const propOids = propIds.map((id: string) => toObjectId(id)).filter((id): id is ObjectId => id !== null);
+            let propertyMap = new Map<string, any>();
+            if (propOids.length > 0) {
+                const props = await propertiesCol
+                    .find({ _id: { $in: propOids }, status: { $ne: "deleted" } })
+                    .toArray();
+                propertyMap = new Map(
+                    (props as any[]).map((p: any) => [toIdString(p._id), p]),
+                );
+            }
+            const itemsWithProperties = (items as any[]).map((item: any) => {
+                const prop = propertyMap.get(item.propertyId);
+                return {
+                    _id: item._id,
+                    propertyId: item.propertyId,
+                    listName: item.listName,
+                    createdAt: item.createdAt,
+                    property: prop
+                        ? {
+                            id: toIdString(prop._id),
+                            title: prop.title,
+                            images: prop.images,
+                            price: prop.price,
+                            location: prop.location,
+                            category: prop.category,
+                            rating: prop.rating,
+                        }
+                        : null,
+                };
+            });
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    items: itemsWithProperties,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch wishlist." });
+        }
+    },
+);
+
+// GET check wishlist
+app.get(
+    "/api/wishlist/check/:propertyId",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("wishlist");
+            const userId = toIdString(req.user!._id);
+            const propertyId = parseId(req.params.propertyId);
+
+            const existing = await col.findOne({ userId, propertyId });
+            res.status(200).json({ success: true, data: { isSaved: !!existing } });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to check wishlist." });
+        }
+    },
+);
+
+// PUT update wishlist list name
+app.put(
+    "/api/wishlist/:id/list",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid wishlist ID." });
+                return;
+            }
+
+            const { listName } = req.body;
+            const db = await getDb();
+            const col = db.collection("wishlist");
+
+            const item = await col.findOne({ _id: objectId });
+            if (!item) {
+                res.status(404).json({ success: false, message: "Wishlist item not found." });
+                return;
+            }
+
+            const userId = toIdString(req.user!._id);
+            if ((item as any).userId !== userId) {
+                res.status(403).json({ success: false, message: "Access denied." });
+                return;
+            }
+
+            await col.updateOne({ _id: objectId }, { $set: { listName: listName || "" } });
+            res.status(200).json({ success: true, message: "List name updated." });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to update list name." });
+        }
+    },
+);
+
+// DELETE wishlist item
+app.delete(
+    "/api/wishlist/:id",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid wishlist ID." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("wishlist");
+
+            const item = await col.findOne({ _id: objectId });
+            if (!item) {
+                res.status(404).json({ success: false, message: "Wishlist item not found." });
+                return;
+            }
+
+            const userId = toIdString(req.user!._id);
+            if ((item as any).userId !== userId) {
+                res.status(403).json({ success: false, message: "Access denied." });
+                return;
+            }
+
+            await col.deleteOne({ _id: objectId });
+            res.status(200).json({ success: true, message: "Removed from wishlist." });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to remove from wishlist." });
+        }
+    },
+);
+
+// GET wishlist lists
+app.get(
+    "/api/wishlist/lists",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("wishlist");
+            const userId = toIdString(req.user!._id);
+
+            const lists = await col.distinct("listName", { userId, listName: { $ne: "" } });
+            res.status(200).json({ success: true, data: { lists: lists.filter(Boolean) } });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch lists." });
+        }
+    },
+);
+
+// ============================================================
+// REVIEW ROUTES
+// ============================================================
+
+// Helper: update property rating
+async function updatePropertyRating(propertiesCol: any, propertyId: string): Promise<void> {
+    try {
+        const reviewsCol = propertiesCol.db.collection("reviews");
+        const stats = await reviewsCol.aggregate([
+            { $match: { propertyId, isReported: { $ne: true } } },
+            { $group: { _id: null, avgRating: { $avg: "$rating" }, count: { $sum: 1 } } },
+        ]).toArray();
+        const avg = stats.length > 0 ? Math.round(((stats[0] as any).avgRating || 0) * 10) / 10 : 0;
+        const cnt = stats.length > 0 ? (stats[0] as any).count || 0 : 0;
+        const propOid = toObjectId(parseId(propertyId));
+        if (propOid) {
+            await propertiesCol.updateOne(
+                { _id: propOid },
+                { $set: { rating: avg, reviewCount: cnt } },
+            );
+        }
+    } catch (err) {
+        console.warn("Failed to update property rating:", err);
+    }
+}
+
+// POST create review (guest)
+app.post(
+    "/api/reviews",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const user = req.user!;
+            const { bookingId, rating, comment } = req.body;
+
+            if (!bookingId || !rating || !comment) {
+                res.status(400).json({ success: false, message: "bookingId, rating, comment are required." });
+                return;
+            }
+
+            const ratingNum = Number(rating);
+            if (ratingNum < 1 || ratingNum > 5 || !Number.isInteger(ratingNum)) {
+                res.status(400).json({ success: false, message: "Rating must be an integer between 1 and 5." });
+                return;
+            }
+
+            const db = await getDb();
+            const bookingsCol = db.collection("bookings");
+            const reviewsCol = db.collection("reviews");
+            const propertiesCol = db.collection("properties");
+
+            const bookingOid = toObjectId(parseId(bookingId));
+            if (!bookingOid) {
+                res.status(400).json({ success: false, message: "Invalid booking ID." });
+                return;
+            }
+
+            const booking = await bookingsCol.findOne({ _id: bookingOid }) as any;
+            if (!booking) {
+                res.status(404).json({ success: false, message: "Booking not found." });
+                return;
+            }
+
+            if (booking.guestId !== toIdString(user._id)) {
+                res.status(403).json({ success: false, message: "You can only review your own bookings." });
+                return;
+            }
+
+            if (booking.status !== "completed") {
+                res.status(400).json({ success: false, message: "You can only review completed bookings." });
+                return;
+            }
+
+            const existingReview = await reviewsCol.findOne({ bookingId });
+            if (existingReview) {
+                res.status(400).json({ success: false, message: "You have already reviewed this booking." });
+                return;
+            }
+
+            const now = new Date();
+            const review: ReviewDoc = {
+                guestId: toIdString(user._id),
+                hostId: booking.hostId,
+                propertyId: booking.propertyId,
+                bookingId,
+                rating: ratingNum,
+                comment: String(comment).trim(),
+                createdAt: now,
+            };
+
+            const result = await reviewsCol.insertOne(review as ReviewDoc);
+            await updatePropertyRating(propertiesCol, booking.propertyId);
+
+            res.status(201).json({
+                success: true,
+                message: "Review submitted.",
+                data: { ...review, _id: result.insertedId },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to submit review." });
+        }
+    },
+);
+
+// GET property reviews (public)
+app.get(
+    "/api/reviews/property/:id",
+    async (req: Request, res: Response): Promise<void> => {
+        try {
+            const propertyId = parseId(req.params.id);
+            const db = await getDb();
+            const reviewsCol = db.collection("reviews");
+            const usersCol = db.collection("user");
+
+            const { page, limit, skip } = getPagination(req.query, 50, 10);
+
+            const filter: Record<string, any> = { propertyId, isReported: { $ne: true } };
+
+            const [reviews, total] = await Promise.all([
+                reviewsCol.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                reviewsCol.countDocuments(filter),
+            ]);
+
+            const reviewsWithGuests = await Promise.all(
+                (reviews as any[]).map(async (r) => {
+                    const guest = await findUserById(usersCol, r.guestId);
+                    return {
+                        ...r,
+                        guest: guest
+                            ? { id: toIdString(guest._id), name: guest.name, image: guest.image }
+                            : null,
+                    };
+                }),
+            );
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    reviews: reviewsWithGuests,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch reviews." });
+        }
+    },
+);
+
+// GET my reviews (guest)
+app.get(
+    "/api/reviews/my-reviews",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const reviewsCol = db.collection("reviews");
+            const bookingsCol = db.collection("bookings");
+            const userId = toIdString(req.user!._id);
+
+            const { page, limit, skip } = getPagination(req.query, 50, 10);
+
+            const [reviews, total] = await Promise.all([
+                reviewsCol.find({ guestId: userId }).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                reviewsCol.countDocuments({ guestId: userId }),
+            ]);
+
+            // Attach property info from bookings (batched)
+            const reviewBookingIds = (reviews as any[]).map((r: any) => parseId(r.bookingId)).filter(Boolean);
+            const reviewBookingOids = reviewBookingIds.map((id: string) => toObjectId(id)).filter((id): id is ObjectId => id !== null);
+            let reviewBookingMap = new Map<string, any>();
+            if (reviewBookingOids.length > 0) {
+                const reviewBookings = await bookingsCol
+                    .find({ _id: { $in: reviewBookingOids } })
+                    .toArray();
+                reviewBookingMap = new Map(
+                    (reviewBookings as any[]).map((b: any) => [toIdString(b._id), b]),
+                );
+            }
+            const reviewsWithProperty = (reviews as any[]).map((r: any) => {
+                const booking = reviewBookingMap.get(r.bookingId);
+                return {
+                    ...r,
+                    propertyTitle: booking?.propertyTitle || "Unknown Property",
+                    propertyImage: booking?.propertyImage || "",
+                };
+            });
+
+            // Get pending reviews (completed bookings without review)
+            const allBookings = await bookingsCol.find({
+                guestId: userId,
+                status: "completed",
+            }).toArray();
+
+            const reviewedBookingIds = new Set((reviews as any[]).map((r) => r.bookingId));
+            const pendingBookings = (allBookings as any[])
+                .filter((b) => !reviewedBookingIds.has(toIdString(b._id)))
+                .map((b) => ({
+                    _id: toIdString(b._id),
+                    propertyTitle: b.propertyTitle,
+                    propertyImage: b.propertyImage,
+                    checkIn: b.checkIn,
+                    checkOut: b.checkOut,
+                }));
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    reviews: reviewsWithProperty,
+                    pending: pendingBookings,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch reviews." });
+        }
+    },
+);
+
+// GET host reviews
+app.get(
+    "/api/reviews/host-reviews",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const reviewsCol = db.collection("reviews");
+            const propertiesCol = db.collection("properties");
+            const usersCol = db.collection("user");
+            const userId = toIdString(req.user!._id);
+
+            const { page, limit, skip } = getPagination(req.query, 50, 10);
+
+            const filter: Record<string, any> = { hostId: userId };
+            if (req.query.propertyId) filter.propertyId = String(req.query.propertyId);
+            if (req.query.rating) filter.rating = Number(req.query.rating);
+
+            const [reviews, total] = await Promise.all([
+                reviewsCol.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                reviewsCol.countDocuments(filter),
+            ]);
+
+            // Enrich reviews (batched)
+            const enrichedItems = reviews as any[];
+            const guestMap = await findUsersMap(usersCol, enrichedItems.map((r: any) => r.guestId));
+            const hostPropIds = enrichedItems
+                .map((r: any) => parseId(r.propertyId))
+                .filter((id): id is string => id !== null);
+            const hostPropOids = hostPropIds.map((id: string) => toObjectId(id)).filter((id): id is ObjectId => id !== null);
+            let hostPropMap = new Map<string, any>();
+            if (hostPropOids.length > 0) {
+                const hostProps = await propertiesCol
+                    .find({ _id: { $in: hostPropOids } })
+                    .toArray();
+                hostPropMap = new Map(
+                    (hostProps as any[]).map((p: any) => [toIdString(p._id), p]),
+                );
+            }
+            const enriched = enrichedItems.map((r: any) => {
+                const guest = guestMap.get(r.guestId);
+                const prop = hostPropMap.get(r.propertyId);
+                return {
+                    ...r,
+                    guest: guest ? { id: toIdString(guest._id), name: guest.name, image: guest.image } : null,
+                    propertyTitle: prop?.title || "Unknown",
+                };
+            });
+
+            // Rating breakdown
+            const breakdown = await reviewsCol.aggregate([
+                { $match: { hostId: userId } },
+                { $group: { _id: "$rating", count: { $sum: 1 } } },
+                { $sort: { _id: -1 } },
+            ]).toArray();
+
+            const ratingBreakdown: Record<number, number> = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+            breakdown.forEach((b: any) => { ratingBreakdown[b._id] = b.count; });
+
+            // Average
+            const avgResult = await reviewsCol.aggregate([
+                { $match: { hostId: userId } },
+                { $group: { _id: null, avg: { $avg: "$rating" } } },
+            ]).toArray();
+            const averageRating = avgResult.length > 0
+                ? Math.round(((avgResult[0] as any).avg || 0) * 10) / 10
+                : 0;
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    reviews: enriched,
+                    stats: { averageRating, totalReviews: total, breakdown: ratingBreakdown },
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch host reviews." });
+        }
+    },
+);
+
+// PUT edit review (guest)
+app.put(
+    "/api/reviews/:id",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid review ID." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("reviews");
+            const review = await col.findOne({ _id: objectId }) as any;
+
+            if (!review) {
+                res.status(404).json({ success: false, message: "Review not found." });
+                return;
+            }
+
+            if (review.guestId !== toIdString(req.user!._id)) {
+                res.status(403).json({ success: false, message: "You can only edit your own reviews." });
+                return;
+            }
+
+            const updates: Record<string, any> = {};
+            if (req.body.rating !== undefined) {
+                const n = Number(req.body.rating);
+                if (n < 1 || n > 5 || !Number.isInteger(n)) {
+                    res.status(400).json({ success: false, message: "Rating must be 1-5." });
+                    return;
+                }
+                updates.rating = n;
+            }
+            if (req.body.comment !== undefined) updates.comment = String(req.body.comment).trim();
+
+            if (Object.keys(updates).length === 0) {
+                res.status(400).json({ success: false, message: "Nothing to update." });
+                return;
+            }
+
+            await col.updateOne({ _id: objectId }, { $set: updates });
+
+            const propertiesCol = db.collection("properties");
+            await updatePropertyRating(propertiesCol, review.propertyId);
+
+            res.status(200).json({ success: true, message: "Review updated." });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to update review." });
+        }
+    },
+);
+
+// PUT reply to review (host)
+app.put(
+    "/api/reviews/:id/reply",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid review ID." });
+                return;
+            }
+
+            const { reply } = req.body;
+            if (!reply) {
+                res.status(400).json({ success: false, message: "Reply text is required." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("reviews");
+            const review = await col.findOne({ _id: objectId }) as any;
+
+            if (!review) {
+                res.status(404).json({ success: false, message: "Review not found." });
+                return;
+            }
+
+            const userId = toIdString(req.user!._id);
+            if (review.hostId !== userId && req.user!.role !== "admin") {
+                res.status(403).json({ success: false, message: "You are not the host of this property." });
+                return;
+            }
+
+            await col.updateOne(
+                { _id: objectId },
+                { $set: { hostReply: String(reply).trim(), hostReplyDate: new Date() } },
+            );
+
+            res.status(200).json({ success: true, message: "Reply posted." });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to post reply." });
+        }
+    },
+);
+
+// DELETE review (guest or admin)
+app.delete(
+    "/api/reviews/:id",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid review ID." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("reviews");
+            const review = await col.findOne({ _id: objectId }) as any;
+
+            if (!review) {
+                res.status(404).json({ success: false, message: "Review not found." });
+                return;
+            }
+
+            const userId = toIdString(req.user!._id);
+            if (review.guestId !== userId && req.user!.role !== "admin") {
+                res.status(403).json({ success: false, message: "Access denied." });
+                return;
+            }
+
+            await col.deleteOne({ _id: objectId });
+
+            const propertiesCol = db.collection("properties");
+            await updatePropertyRating(propertiesCol, review.propertyId);
+
+            res.status(200).json({ success: true, message: "Review deleted." });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to delete review." });
+        }
+    },
+);
+
+// PUT report review
+app.put(
+    "/api/reviews/:id/report",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid review ID." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("reviews");
+            const review = await col.findOne({ _id: objectId }) as any;
+
+            if (!review) {
+                res.status(404).json({ success: false, message: "Review not found." });
+                return;
+            }
+
+            if (review.guestId === toIdString(req.user!._id)) {
+                res.status(400).json({ success: false, message: "You cannot report your own review." });
+                return;
+            }
+
+            await col.updateOne({ _id: objectId }, { $set: { isReported: true } });
+            res.status(200).json({ success: true, message: "Review reported for moderation." });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to report review." });
+        }
+    },
+);
+
+// GET admin reviews
+app.get(
+    "/api/admin/reviews",
+    verifyToken,
+    verifyAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("reviews");
+            const { page, limit, skip } = getPagination(req.query, 100, 20);
+
+            const filter: Record<string, any> = {};
+            if (req.query.reported === "true") filter.isReported = true;
+            if (req.query.rating) filter.rating = Number(req.query.rating);
+            if (req.query.propertyId) filter.propertyId = String(req.query.propertyId);
+
+            const [reviews, total] = await Promise.all([
+                col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+                col.countDocuments(filter),
+            ]);
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    reviews,
+                    pagination: {
+                        total,
+                        totalPages: Math.ceil(total / limit),
+                        currentPage: page,
+                        limit,
+                    },
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch reviews." });
+        }
+    },
+);
+
+// ============================================================
+// MESSAGE ROUTES
+// ============================================================
+
+// POST start conversation
+app.post(
+    "/api/conversations",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const { participantId, bookingId, propertyId } = req.body;
+            const userId = toIdString(req.user!._id);
+
+            if (!participantId) {
+                res.status(400).json({ success: false, message: "participantId is required." });
+                return;
+            }
+            if (participantId === userId) {
+                res.status(400).json({ success: false, message: "Cannot start conversation with yourself." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("conversations");
+
+            // Check for existing conversation between these two participants
+            const participants = [userId, participantId].sort();
+            const existing = await col.findOne({ participants }) as any;
+            if (existing) {
+                res.status(200).json({ success: true, data: { ...existing, _id: toIdString(existing._id) } });
+                return;
+            }
+
+            const doc: ConversationDoc = {
+                participants,
+                bookingId: bookingId || undefined,
+                propertyId: propertyId || undefined,
+                lastMessage: undefined,
+                lastMessageAt: undefined,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+            };
+            const result = await col.insertOne(doc);
+            res.status(201).json({
+                success: true,
+                data: { ...doc, _id: toIdString(result.insertedId) },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to start conversation." });
+        }
+    },
+);
+
+// GET conversations list
+app.get(
+    "/api/conversations",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const userId = toIdString(req.user!._id);
+            const db = await getDb();
+            const col = db.collection("conversations");
+            const { page, limit, skip } = getPagination(req.query, 50, 20);
+
+            const [conversations, total] = await Promise.all([
+                col.find({ participants: userId })
+                    .sort({ lastMessageAt: -1, updatedAt: -1 })
+                    .skip(skip)
+                    .limit(limit)
+                    .toArray(),
+                col.countDocuments({ participants: userId }),
+            ]);
+
+            // Enrich with the other participant's basic info
+            const otherIds = (conversations as any[]).map((c: any) =>
+                c.participants.find((p: string) => p !== userId),
+            ).filter(Boolean);
+            const localUsersCol = db.collection("user");
+            const otherUserMap = await findUsersMap(localUsersCol, otherIds);
+
+            const enriched = (conversations as any[]).map((c: any) => {
+                const otherId = c.participants.find((p: string) => p !== userId);
+                const otherUser = otherId ? otherUserMap.get(otherId) : null;
+                return {
+                    _id: toIdString(c._id),
+                    participants: c.participants,
+                    bookingId: c.bookingId,
+                    propertyId: c.propertyId,
+                    lastMessage: c.lastMessage,
+                    lastMessageAt: c.lastMessageAt,
+                    createdAt: c.createdAt,
+                    updatedAt: c.updatedAt,
+                    otherUser: otherUser
+                        ? { id: toIdString(otherUser._id), name: otherUser.name, image: otherUser.image }
+                        : null,
+                };
+            });
+
+            res.status(200).json({
+                success: true,
+                data: enriched,
+                pagination: { total, totalPages: Math.ceil(total / limit), currentPage: page, limit },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch conversations." });
+        }
+    },
+);
+
+// POST send message
+app.post(
+    "/api/messages",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const { conversationId, content } = req.body;
+            const userId = toIdString(req.user!._id);
+
+            if (!conversationId || !content) {
+                res.status(400).json({ success: false, message: "conversationId and content are required." });
+                return;
+            }
+
+            const db = await getDb();
+            const convCol = db.collection("conversations");
+            const msgCol = db.collection("messages");
+
+            const convOid = toObjectId(parseId(conversationId));
+            if (!convOid) {
+                res.status(400).json({ success: false, message: "Invalid conversation ID." });
+                return;
+            }
+
+            const conversation = await convCol.findOne({ _id: convOid }) as any;
+            if (!conversation) {
+                res.status(404).json({ success: false, message: "Conversation not found." });
+                return;
+            }
+            if (!conversation.participants.includes(userId)) {
+                res.status(403).json({ success: false, message: "You are not a participant in this conversation." });
+                return;
+            }
+
+            const msgDoc: MessageDoc = {
+                conversationId,
+                senderId: userId,
+                content,
+                isRead: false,
+                createdAt: new Date(),
+            };
+            const result = await msgCol.insertOne(msgDoc);
+
+            await convCol.updateOne(
+                { _id: convOid },
+                { $set: { lastMessage: content, lastMessageAt: new Date(), updatedAt: new Date() } },
+            );
+
+            res.status(201).json({ success: true, data: { ...msgDoc, _id: toIdString(result.insertedId) } });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to send message." });
+        }
+    },
+);
+
+// GET unread count (must be before :conversationId)
+app.get(
+    "/api/messages/unread-count",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const userId = toIdString(req.user!._id);
+            const db = await getDb();
+            const convCol = db.collection("conversations");
+            const msgCol = db.collection("messages");
+
+            const conversations = await convCol.find({ participants: userId }).toArray();
+            const convIds = (conversations as any[]).map((c: any) => toIdString(c._id));
+
+            if (convIds.length === 0) {
+                res.status(200).json({ success: true, data: { unreadCount: 0 } });
+                return;
+            }
+
+            const unreadCount = await msgCol.countDocuments({
+                conversationId: { $in: convIds },
+                senderId: { $ne: userId },
+                isRead: false,
+            });
+
+            res.status(200).json({ success: true, data: { unreadCount } });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to get unread count." });
+        }
+    },
+);
+
+// GET messages for a conversation (paginated)
+app.get(
+    "/api/messages/:conversationId",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const { conversationId } = req.params;
+            const userId = toIdString(req.user!._id);
+            const db = await getDb();
+            const convCol = db.collection("conversations");
+            const msgCol = db.collection("messages");
+            const { page, limit, skip } = getPagination(req.query, 50, 50);
+
+            // Verify participant
+            const convOid = toObjectId(parseId(conversationId));
+            if (!convOid) {
+                res.status(400).json({ success: false, message: "Invalid conversation ID." });
+                return;
+            }
+            const conversation = await convCol.findOne({ _id: convOid, participants: userId }) as any;
+            if (!conversation) {
+                res.status(404).json({ success: false, message: "Conversation not found." });
+                return;
+            }
+
+            const [messages, total] = await Promise.all([
+                msgCol.find({ conversationId })
+                    .sort({ createdAt: 1 })
+                    .skip(skip)
+                    .limit(limit)
+                    .toArray(),
+                msgCol.countDocuments({ conversationId }),
+            ]);
+
+            res.status(200).json({
+                success: true,
+                data: (messages as any[]).map((m: any) => ({ ...m, _id: toIdString(m._id) })),
+                pagination: { total, totalPages: Math.ceil(total / limit), currentPage: page, limit },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch messages." });
+        }
+    },
+);
+
+// PUT mark single message as read
+app.put(
+    "/api/messages/:id/read",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const messageId = req.params.id;
+            const userId = toIdString(req.user!._id);
+            const db = await getDb();
+            const msgCol = db.collection("messages");
+
+            const msgOid = toObjectId(parseId(messageId));
+            if (!msgOid) {
+                res.status(400).json({ success: false, message: "Invalid message ID." });
+                return;
+            }
+
+            const message = await msgCol.findOne({ _id: msgOid }) as any;
+            if (!message) {
+                res.status(404).json({ success: false, message: "Message not found." });
+                return;
+            }
+            if (message.senderId === userId) {
+                res.status(400).json({ success: false, message: "Cannot mark your own message as read." });
+                return;
+            }
+
+            // Verify the user is a participant in the conversation
+            const db2 = await getDb();
+            const convCol = db2.collection("conversations");
+            const convOid = toObjectId(parseId(message.conversationId));
+            const isParticipant = convOid
+                ? await convCol.findOne({ _id: convOid, participants: userId })
+                : null;
+            if (!isParticipant) {
+                res.status(403).json({ success: false, message: "Not a participant." });
+                return;
+            }
+
+            await msgCol.updateOne({ _id: msgOid }, { $set: { isRead: true } });
+            res.status(200).json({ success: true, message: "Message marked as read." });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to mark message as read." });
+        }
+    },
+);
+
+// PUT mark all messages in conversation as read
+app.put(
+    "/api/conversations/:id/read-all",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const conversationId = req.params.id;
+            const userId = toIdString(req.user!._id);
+            const db = await getDb();
+            const convCol = db.collection("conversations");
+            const msgCol = db.collection("messages");
+
+            const convOid = toObjectId(parseId(conversationId));
+            if (!convOid) {
+                res.status(400).json({ success: false, message: "Invalid conversation ID." });
+                return;
+            }
+
+            const isParticipant = await convCol.findOne({ _id: convOid, participants: userId }) as any;
+            if (!isParticipant) {
+                res.status(404).json({ success: false, message: "Conversation not found." });
+                return;
+            }
+
+            await msgCol.updateMany(
+                { conversationId, senderId: { $ne: userId }, isRead: false },
+                { $set: { isRead: true } },
+            );
+
+            res.status(200).json({ success: true, message: "All messages marked as read." });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to mark messages as read." });
         }
     },
 );
