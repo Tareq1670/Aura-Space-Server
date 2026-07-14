@@ -86,13 +86,14 @@ async function stripeWebhookHandler(req: Request, res: Response): Promise<void> 
 
     try {
         const db = await getDb();
+        const client = await getClientPromise();
         const bookingsCol = db.collection("bookings");
         const transactionsCol = db.collection("transactions");
 
         switch (event.type) {
             case "checkout.session.completed": {
-                const session = event.data.object as Stripe.Checkout.Session;
-                const bookingId = session.metadata?.bookingId;
+                const stripeSession = event.data.object as Stripe.Checkout.Session;
+                const bookingId = stripeSession.metadata?.bookingId;
 
                 if (!bookingId) {
                     console.warn("Webhook: No bookingId in session metadata");
@@ -114,35 +115,49 @@ async function stripeWebhookHandler(req: Request, res: Response): Promise<void> 
                     return;
                 }
 
-                // Idempotency check — prevent duplicate webhook processing
-                const idempotencyKey = `stripe_${session.id}`;
-                const existingTxn = await transactionsCol.findOne({ transactionId: idempotencyKey });
-                if (existingTxn) {
-                    console.log(`Webhook: Session ${session.id} already processed, skipping`);
+                const idempotencyKey = `stripe_${stripeSession.id}`;
+                await confirmBookingAndCreateTransaction(
+                    bookingsCol, transactionsCol, client,
+                    bookingId, booking, idempotencyKey,
+                    stripeSession.currency || process.env.STRIPE_CURRENCY || "usd",
+                );
+
+                console.log(`✅ Booking ${bookingId} confirmed via Stripe webhook (session: ${stripeSession.id})`);
+                break;
+            }
+
+            case "payment_intent.succeeded": {
+                const paymentIntent = event.data.object as Stripe.PaymentIntent;
+                const bookingId = paymentIntent.metadata?.bookingId;
+
+                if (!bookingId) {
+                    console.warn("Webhook: No bookingId in payment_intent metadata");
                     res.status(200).json({ received: true });
                     return;
                 }
 
-                await bookingsCol.updateOne(
-                    { _id: objectId },
-                    { $set: { status: "confirmed", updatedAt: new Date() } },
+                const objectId = toObjectId(parseId(bookingId));
+                if (!objectId) {
+                    console.warn("Webhook: Invalid bookingId:", bookingId);
+                    res.status(200).json({ received: true });
+                    return;
+                }
+
+                const booking = await bookingsCol.findOne({ _id: objectId }) as any;
+                if (!booking) {
+                    console.warn("Webhook: Booking not found:", bookingId);
+                    res.status(200).json({ received: true });
+                    return;
+                }
+
+                const idempotencyKey = `pi_${paymentIntent.id}`;
+                await confirmBookingAndCreateTransaction(
+                    bookingsCol, transactionsCol, client,
+                    bookingId, booking, idempotencyKey,
+                    paymentIntent.currency || process.env.STRIPE_CURRENCY || "usd",
                 );
 
-                const txnId = idempotencyKey;
-                await transactionsCol.insertOne({
-                    userId: booking.guestId,
-                    bookingId,
-                    type: "payment" as const,
-                    amount: booking.totalAmount,
-                    currency: (session.currency || process.env.STRIPE_CURRENCY || "usd").toUpperCase(),
-                    method: "card" as const,
-                    status: "success" as const,
-                    transactionId: txnId,
-                    description: `Payment for booking at ${booking.propertyTitle}`,
-                    createdAt: new Date(),
-                });
-
-                console.log(`✅ Booking ${bookingId} confirmed via Stripe webhook (session: ${session.id})`);
+                console.log(`✅ Booking ${bookingId} confirmed via PaymentIntent (pi: ${paymentIntent.id})`);
                 break;
             }
 
@@ -177,7 +192,49 @@ async function stripeWebhookHandler(req: Request, res: Response): Promise<void> 
         res.status(200).json({ received: true });
     } catch (error) {
         console.error("Webhook handler error:", error);
-        res.status(200).json({ received: true });
+        res.status(500).json({ received: false, message: "Internal server error" });
+    }
+}
+
+async function confirmBookingAndCreateTransaction(
+    bookingsCol: any,
+    transactionsCol: any,
+    client: any,
+    bookingId: string,
+    booking: any,
+    idempotencyKey: string,
+    currency: string,
+): Promise<void> {
+    const objectId = toObjectId(parseId(bookingId));
+    if (!objectId) return;
+
+    const existingTxn = await transactionsCol.findOne({ transactionId: idempotencyKey });
+    if (existingTxn) return;
+
+    const mongoSession = client.startSession();
+    try {
+        await mongoSession.withTransaction(async () => {
+            await bookingsCol.updateOne(
+                { _id: objectId },
+                { $set: { status: "confirmed", updatedAt: new Date() } },
+                { session: mongoSession },
+            );
+
+            await transactionsCol.insertOne({
+                userId: booking.guestId,
+                bookingId,
+                type: "payment" as const,
+                amount: booking.totalAmount,
+                currency: currency.toUpperCase(),
+                method: "card" as const,
+                status: "success" as const,
+                transactionId: idempotencyKey,
+                description: `Payment for booking at ${booking.propertyTitle}`,
+                createdAt: new Date(),
+            }, { session: mongoSession });
+        });
+    } finally {
+        await mongoSession.endSession();
     }
 }
 
@@ -358,7 +415,7 @@ interface TransactionDoc {
 // BOOKING
 // ============================================================
 
-type BookingStatus = "pending" | "confirmed" | "cancelled" | "completed";
+type BookingStatus = "pending" | "confirmed" | "cancelled" | "completed" | "checked-in";
 
 interface BookingDoc {
     _id?: ObjectId;
@@ -665,10 +722,15 @@ ensureMessageIndexes().catch((err) =>
 // ============================================================
 
 let JWKS: ReturnType<typeof createRemoteJWKSet> | null = null;
+let JWKSGeneratedAt = 0;
+const JWKS_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 function getJWKS() {
-    if (!JWKS)
+    const now = Date.now();
+    if (!JWKS || (now - JWKSGeneratedAt) > JWKS_TTL_MS) {
         JWKS = createRemoteJWKSet(new URL(`${FRONTEND_URL}/api/auth/jwks`));
+        JWKSGeneratedAt = now;
+    }
     return JWKS;
 }
 
@@ -768,6 +830,18 @@ function getPagination(
     );
     const skip = (page - 1) * limit;
     return { page, limit, skip };
+}
+
+function buildPaginationResponse(total: number, page: number, limit: number) {
+    const totalPages = Math.ceil(total / limit);
+    return {
+        total,
+        totalPages,
+        currentPage: page,
+        limit,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1,
+    };
 }
 
 // ✅ Fix 3: explicit Cloudinary callback types (no implicit any)
@@ -1311,6 +1385,32 @@ const verifyToken = async (
             error?.code === "ERR_JWT_INVALID"
         ) {
             res.status(401).json({ success: false, message: "Invalid token." });
+            return;
+        }
+        if (error?.code === "ERR_JWKS_NO_MATCHING_KEY") {
+            res.status(401).json({
+                success: false,
+                message: "Authentication service unavailable (key mismatch).",
+            });
+            return;
+        }
+        if (error?.code === "ERR_JWKS_MULTIPLE_MATCHING_KEYS") {
+            res.status(401).json({
+                success: false,
+                message: "Authentication service error (multiple keys).",
+            });
+            return;
+        }
+        if (
+            error?.message?.includes("fetch") ||
+            error?.message?.includes("ECONNREFUSED") ||
+            error?.message?.includes("ENOTFOUND")
+        ) {
+            console.error("[verifyToken] JWKS fetch failed:", error.message);
+            res.status(503).json({
+                success: false,
+                message: "Authentication service unreachable. Try again later.",
+            });
             return;
         }
         console.error("[verifyToken] error:", error);
@@ -3805,6 +3905,7 @@ app.post(
             }
 
             const db = await getDb();
+            const client = await getClientPromise();
             const propertiesCol = db.collection("properties");
             const bookingsCol = db.collection("bookings");
 
@@ -3826,17 +3927,6 @@ app.post(
                 res.status(400).json({
                     success: false,
                     message: `Maximum ${property.details.maxGuests} guests allowed.`,
-                });
-                return;
-            }
-
-            const hasOverlap = await checkDateOverlap(
-                bookingsCol, propertyId, checkInDate, checkOutDate
-            );
-            if (hasOverlap) {
-                res.status(409).json({
-                    success: false,
-                    message: "This property is already booked for the selected dates.",
                 });
                 return;
             }
@@ -3870,16 +3960,39 @@ app.post(
                 updatedAt: now,
             };
 
-            const result = await bookingsCol.insertOne(booking as BookingDoc);
+            // Atomic transaction — prevents double-booking race condition
+            const session = client.startSession();
+            let result;
+            try {
+                await session.withTransaction(async () => {
+                    const hasOverlap = await checkDateOverlap(
+                        bookingsCol, propertyId, checkInDate, checkOutDate
+                    );
+                    if (hasOverlap) {
+                        throw new Error("OVERLAP_CONFLICT");
+                    }
+
+                    result = await bookingsCol.insertOne(booking as BookingDoc, { session });
+                });
+            } finally {
+                await session.endSession();
+            }
 
             res.status(201).json({
                 success: true,
                 message: "Booking created. Proceed to payment.",
                 data: {
-                    booking: { ...booking, _id: result.insertedId },
+                    booking: { ...booking, _id: result!.insertedId },
                 },
             });
-        } catch (error) {
+        } catch (error: any) {
+            if (error?.message === "OVERLAP_CONFLICT") {
+                res.status(409).json({
+                    success: false,
+                    message: "This property is already booked for the selected dates.",
+                });
+                return;
+            }
             console.error("Create booking error:", error);
             res.status(500).json({ success: false, message: "Failed to create booking." });
         }
@@ -4313,6 +4426,79 @@ app.put(
 );
 
 // ============================================================
+// PAYMENT INTENT ROUTE (embedded Elements flow)
+// ============================================================
+
+// POST create PaymentIntent for embedded card payment
+app.post(
+    "/api/payments/create-payment-intent",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        if (!stripe) {
+            res.status(503).json({ success: false, message: "Stripe not configured." });
+            return;
+        }
+
+        try {
+            const user = req.user!;
+            const { bookingId } = req.body;
+
+            if (!bookingId) {
+                res.status(400).json({ success: false, message: "bookingId is required." });
+                return;
+            }
+
+            const db = await getDb();
+            const bookingsCol = db.collection("bookings");
+            const objectId = toObjectId(parseId(bookingId));
+
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid booking ID." });
+                return;
+            }
+
+            const booking = await bookingsCol.findOne({ _id: objectId }) as any;
+            if (!booking) {
+                res.status(404).json({ success: false, message: "Booking not found." });
+                return;
+            }
+
+            const userId = toIdString(user._id);
+            if (booking.guestId !== userId) {
+                res.status(403).json({ success: false, message: "This booking does not belong to you." });
+                return;
+            }
+
+            if (booking.status !== "pending") {
+                res.status(400).json({ success: false, message: "Only pending bookings can be paid." });
+                return;
+            }
+
+            const paymentIntent = await stripe.paymentIntents.create({
+                amount: Math.round(booking.totalAmount * 100),
+                currency: (process.env.STRIPE_CURRENCY || "usd").toLowerCase(),
+                metadata: {
+                    bookingId,
+                    guestId: userId,
+                },
+                description: `Booking at ${booking.propertyTitle || "StayEase property"}`,
+            });
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    clientSecret: paymentIntent.client_secret,
+                    paymentIntentId: paymentIntent.id,
+                },
+            });
+        } catch (error: any) {
+            console.error("Create PaymentIntent error:", error);
+            res.status(500).json({ success: false, message: "Failed to create payment intent." });
+        }
+    },
+);
+
+// ============================================================
 // PAYOUT ROUTES (host bank details, manual payouts)
 // ============================================================
 
@@ -4380,10 +4566,18 @@ app.get(
                 return;
             }
 
-            // Mask account number
+            // Mask sensitive fields
             const accNum = method.accountNumber || "";
-            const masked = accNum.length > 4
+            const maskedAccount = accNum.length > 4
                 ? "****" + accNum.slice(-4)
+                : "****";
+            const rtNum = method.routingNumber || "";
+            const maskedRouting = rtNum.length > 4
+                ? "****" + rtNum.slice(-4)
+                : "****";
+            const swCode = method.swiftCode || "";
+            const maskedSwift = swCode.length > 4
+                ? "****" + swCode.slice(-4)
                 : "****";
 
             res.status(200).json({
@@ -4392,9 +4586,9 @@ app.get(
                     id: toIdString(method._id),
                     accountHolder: method.accountHolder,
                     bankName: method.bankName,
-                    accountNumber: masked,
-                    routingNumber: method.routingNumber,
-                    swiftCode: method.swiftCode,
+                    accountNumber: maskedAccount,
+                    routingNumber: maskedRouting,
+                    swiftCode: maskedSwift,
                     bankAddress: method.bankAddress,
                     createdAt: method.createdAt,
                     updatedAt: method.updatedAt,
@@ -4606,7 +4800,68 @@ app.get(
     },
 );
 
-// GET single transaction
+// GET transaction stats (MUST be before /:id — Express matches in order)
+app.get(
+    "/api/transactions/stats",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("transactions");
+            const userId = toIdString(req.user!._id);
+            const isAdmin = req.user!.role === "admin";
+
+            let matchFilter: Record<string, any> = {};
+            if (!isAdmin) {
+                matchFilter = { userId };
+            }
+
+            const totalSpendArr = await col.aggregate([
+                { $match: { ...matchFilter, type: "payment", status: "success" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray();
+            const totalSpend = (totalSpendArr[0] as any)?.total || 0;
+
+            const totalEarnArr = await col.aggregate([
+                { $match: { ...matchFilter, type: "payout", status: "success" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray();
+            const totalEarned = (totalEarnArr[0] as any)?.total || 0;
+
+            let commissionEarned = 0;
+            let pendingPayouts = 0;
+            if (isAdmin) {
+                const commissionArr = await col.aggregate([
+                    { $match: { type: "commission", status: "success" } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).toArray();
+                commissionEarned = (commissionArr[0] as any)?.total || 0;
+
+                const pendingArr = await col.aggregate([
+                    { $match: { type: "payout", status: "pending" } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).toArray();
+                pendingPayouts = (pendingArr[0] as any)?.total || 0;
+            }
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    totalSpend: Math.round(totalSpend * 100) / 100,
+                    totalEarned: Math.round(totalEarned * 100) / 100,
+                    ...(isAdmin ? {
+                        commissionEarned: Math.round(commissionEarned * 100) / 100,
+                        pendingPayouts: Math.round(pendingPayouts * 100) / 100,
+                    } : {}),
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch transaction stats." });
+        }
+    },
+);
+
+// GET single transaction (must be after specific routes)
 app.get(
     "/api/transactions/:id",
     verifyToken,
@@ -4752,69 +5007,6 @@ app.get(
     },
 );
 
-// GET transaction stats
-app.get(
-    "/api/transactions/stats",
-    verifyToken,
-    async (req: AuthRequest, res: Response): Promise<void> => {
-        try {
-            const db = await getDb();
-            const col = db.collection("transactions");
-            const userId = toIdString(req.user!._id);
-            const isAdmin = req.user!.role === "admin";
-
-            let matchFilter: Record<string, any> = {};
-            if (!isAdmin) {
-                matchFilter = { userId };
-            }
-
-            // Total spend (guest payments)
-            const totalSpendArr = await col.aggregate([
-                { $match: { ...matchFilter, type: "payment", status: "success" } },
-                { $group: { _id: null, total: { $sum: "$amount" } } },
-            ]).toArray();
-            const totalSpend = (totalSpendArr[0] as any)?.total || 0;
-
-            // Total earned (host earnings)
-            const totalEarnArr = await col.aggregate([
-                { $match: { ...matchFilter, type: "payout", status: "success" } },
-                { $group: { _id: null, total: { $sum: "$amount" } } },
-            ]).toArray();
-            const totalEarned = (totalEarnArr[0] as any)?.total || 0;
-
-            // Platform commission earned (admin only)
-            let commissionEarned = 0;
-            let pendingPayouts = 0;
-            if (isAdmin) {
-                const commissionArr = await col.aggregate([
-                    { $match: { type: "commission", status: "success" } },
-                    { $group: { _id: null, total: { $sum: "$amount" } } },
-                ]).toArray();
-                commissionEarned = (commissionArr[0] as any)?.total || 0;
-
-                const pendingArr = await col.aggregate([
-                    { $match: { type: "payout", status: "pending" } },
-                    { $group: { _id: null, total: { $sum: "$amount" } } },
-                ]).toArray();
-                pendingPayouts = (pendingArr[0] as any)?.total || 0;
-            }
-
-            res.status(200).json({
-                success: true,
-                data: {
-                    totalSpend: Math.round(totalSpend * 100) / 100,
-                    totalEarned: Math.round(totalEarned * 100) / 100,
-                    ...(isAdmin ? {
-                        commissionEarned: Math.round(commissionEarned * 100) / 100,
-                        pendingPayouts: Math.round(pendingPayouts * 100) / 100,
-                    } : {}),
-                },
-            });
-        } catch {
-            res.status(500).json({ success: false, message: "Failed to fetch transaction stats." });
-        }
-    },
-);
 
 // POST admin process payout
 app.post(
@@ -5211,17 +5403,19 @@ app.get(
                 reviewsCol.countDocuments(filter),
             ]);
 
-            const reviewsWithGuests = await Promise.all(
-                (reviews as any[]).map(async (r) => {
-                    const guest = await findUserById(usersCol, r.guestId);
-                    return {
-                        ...r,
-                        guest: guest
-                            ? { id: toIdString(guest._id), name: guest.name, image: guest.image }
-                            : null,
-                    };
-                }),
-            );
+            // Batch user lookup — replaces N+1
+            const guestIds = (reviews as any[]).map((r: any) => r.guestId).filter(Boolean);
+            const usersMap = guestIds.length > 0 ? await findUsersMap(usersCol, guestIds) : new Map();
+
+            const reviewsWithGuests = (reviews as any[]).map((r) => {
+                const guest = usersMap.get(r.guestId);
+                return {
+                    ...r,
+                    guest: guest
+                        ? { id: toIdString(guest._id), name: guest.name, image: guest.image }
+                        : null,
+                };
+            });
 
             res.status(200).json({
                 success: true,
