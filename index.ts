@@ -4660,6 +4660,7 @@ app.post(
                 return_url: `${FRONTEND_URL}/checkout/return?session_id={CHECKOUT_SESSION_ID}`,
                 metadata: {
                     bookingId,
+                    propertyId: booking.propertyId,
                     guestId: userId,
                 },
             });
@@ -6046,6 +6047,39 @@ app.get(
             });
         } catch {
             res.status(500).json({ success: false, message: "Failed to fetch reviews." });
+        }
+    },
+);
+
+// PUT dismiss review report (admin only)
+app.put(
+    "/api/admin/reviews/:id/dismiss-report",
+    verifyToken,
+    verifyAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const id = parseId(req.params.id);
+            const objectId = toObjectId(id);
+            if (!objectId) {
+                res.status(400).json({ success: false, message: "Invalid review ID." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("reviews");
+            const result = await col.updateOne(
+                { _id: objectId },
+                { $unset: { isReported: "" } },
+            );
+
+            if (result.matchedCount === 0) {
+                res.status(404).json({ success: false, message: "Review not found." });
+                return;
+            }
+
+            res.status(200).json({ success: true, message: "Report dismissed." });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to dismiss report." });
         }
     },
 );
