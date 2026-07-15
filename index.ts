@@ -24,10 +24,39 @@ dotenv.config();
 
 const app = express();
 
-app.use(helmet());
+const allowedOrigins = [
+    process.env.FRONTEND_URL,
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://aura-space-ochre.vercel.app",
+].filter(Boolean) as string[];
+
+app.use(
+    helmet({
+        contentSecurityPolicy: {
+            directives: {
+                defaultSrc: ["'self'"],
+                connectSrc: ["'self'", ...allowedOrigins],
+                imgSrc: ["'self'", "data:", "https://res.cloudinary.com", "https://images.unsplash.com", "https://i.ibb.co"],
+                scriptSrc: ["'self'"],
+                styleSrc: ["'self'", "'unsafe-inline'"],
+                fontSrc: ["'self'"],
+                objectSrc: ["'none'"],
+                frameSrc: ["'none'"],
+            },
+        },
+    }),
+);
+
 app.use(
     cors({
-        origin: process.env.FRONTEND_URL,
+        origin: (origin, callback) => {
+            if (!origin || allowedOrigins.includes(origin) || origin.startsWith("http://localhost:")) {
+                callback(null, true);
+            } else {
+                callback(new Error("Not allowed by CORS"));
+            }
+        },
         credentials: true,
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowedHeaders: ["Content-Type", "Authorization"],
@@ -2532,6 +2561,14 @@ app.post(
     verifyHostOrAdmin,
     upload.array("images", MAX_FILES),
     async (req: AuthRequest, res: Response): Promise<void> => {
+        if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+            res.status(500).json({
+                success: false,
+                message: "Cloudinary is not configured. Please set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in your .env file.",
+            });
+            return;
+        }
+
         try {
             // ✅ Fix 4: cast req.files to array (multer attaches it)
             const files = (req.files as Express.Multer.File[]) || [];
@@ -4265,7 +4302,10 @@ app.get(
             const [guest, host, property] = await Promise.all([
                 findUserById(usersCol, booking.guestId),
                 findUserById(usersCol, booking.hostId),
-                propertiesCol.findOne({ _id: toObjectId(parseId(booking.propertyId))! }),
+                (() => {
+                    const propId = toObjectId(parseId(booking.propertyId));
+                    return propId ? propertiesCol.findOne({ _id: propId }) : Promise.resolve(null);
+                })(),
             ]);
 
             res.status(200).json({
@@ -5455,8 +5495,21 @@ app.get(
             const col = db.collection("wishlist");
             const userId = toIdString(req.user!._id);
 
-            const lists = await col.distinct("listName", { userId, listName: { $ne: "" } });
-            res.status(200).json({ success: true, data: { lists: lists.filter(Boolean) } });
+            const page = Math.max(1, parseInt(req.query.page as string) || 1);
+            const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
+
+            const allLists = (await col.distinct("listName", { userId, listName: { $ne: "" } })).filter(Boolean) as string[];
+            const total = allLists.length;
+            const totalPages = Math.ceil(total / limit);
+            const paginatedLists = allLists.slice((page - 1) * limit, page * limit);
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    lists: paginatedLists,
+                    pagination: { total, totalPages, currentPage: page, limit },
+                },
+            });
         } catch {
             res.status(500).json({ success: false, message: "Failed to fetch lists." });
         }
@@ -6419,6 +6472,9 @@ app.get(
 
             const now = new Date();
             const startOfYear = new Date(now.getFullYear(), 0, 1);
+            const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+            const startOfNextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+            const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
 
             const hostProperties = await propertiesCol.find({ hostId: userId }).toArray();
             const propertyIds = hostProperties.map((p: any) => p._id);
@@ -6432,6 +6488,7 @@ app.get(
                 totalIncomeResult,
                 monthlyIncomeResult,
                 recentReservations,
+                occupancyResult,
             ] = await Promise.all([
                 bookingsCol.countDocuments({ hostId: userId, status: "confirmed" }),
                 bookingsCol.find({ hostId: userId, status: "pending" })
@@ -6455,6 +6512,11 @@ app.get(
                     .sort({ createdAt: -1 })
                     .limit(5)
                     .toArray(),
+                bookingsCol.aggregate([
+                    { $match: { hostId: userId, status: { $in: ["confirmed", "completed"] }, checkIn: { $lt: startOfNextMonth }, checkOut: { $gt: startOfMonth } } },
+                    { $project: { nightsInMonth: { $ceil: { $divide: [{ $subtract: [{ $min: ["$checkOut", startOfNextMonth] }, { $max: ["$checkIn", startOfMonth] }] }, 86400000] } } } },
+                    { $group: { _id: null, totalBookedNights: { $sum: "$nightsInMonth" } } },
+                ]).toArray(),
             ]);
 
             const averageRating = reviewsResult.length > 0 ? Math.round(reviewsResult[0].avg * 10) / 10 : 0;
@@ -6476,8 +6538,9 @@ app.get(
 
             const totalConfirmed = activeBookings;
             const totalPendings = pendingBookings.length;
-            const occupancyRate = totalProperties > 0
-                ? Math.round(((totalPendings + totalConfirmed) / totalProperties) * 100)
+            const totalBookedNights = occupancyResult.length > 0 ? occupancyResult[0].totalBookedNights : 0;
+            const occupancyRate = totalProperties > 0 && daysInMonth > 0
+                ? Math.round((totalBookedNights / (totalProperties * daysInMonth)) * 100)
                 : 0;
 
             res.status(200).json({
@@ -6513,6 +6576,7 @@ app.get(
             const bookingsCol = db.collection("bookings");
             const transactionsCol = db.collection("transactions");
             const usersCol = db.collection("user");
+            const reviewsCol = db.collection("reviews");
 
             const now = new Date();
             const startOfYear = new Date(now.getFullYear(), 0, 1);
@@ -6526,6 +6590,7 @@ app.get(
                 signupsResult,
                 bookingsByStatus,
                 propertiesByCategory,
+                reportedReviews,
             ] = await Promise.all([
                 usersCol.countDocuments(),
                 propertiesCol.countDocuments(),
@@ -6547,6 +6612,7 @@ app.get(
                     { $group: { _id: "$category", count: { $sum: 1 } } },
                     { $sort: { count: -1 } },
                 ]).toArray(),
+                reviewsCol.countDocuments({ isReported: true }),
             ]);
 
             const commissionEarned = statsResult.length > 0 ? statsResult[0].commission : 0;
@@ -6585,6 +6651,7 @@ app.get(
                     signupTrend,
                     bookingStatusData,
                     categoryData,
+                    reportedReviews,
                 },
             });
         } catch {

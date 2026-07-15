@@ -16,9 +16,35 @@ const stream_1 = require("stream");
 const stripe_1 = __importDefault(require("stripe"));
 dotenv_1.default.config();
 const app = (0, express_1.default)();
-app.use((0, helmet_1.default)());
+const allowedOrigins = [
+    process.env.FRONTEND_URL,
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://aura-space-ochre.vercel.app",
+].filter(Boolean);
+app.use((0, helmet_1.default)({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            connectSrc: ["'self'", ...allowedOrigins],
+            imgSrc: ["'self'", "data:", "https://res.cloudinary.com", "https://images.unsplash.com", "https://i.ibb.co"],
+            scriptSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            fontSrc: ["'self'"],
+            objectSrc: ["'none'"],
+            frameSrc: ["'none'"],
+        },
+    },
+}));
 app.use((0, cors_1.default)({
-    origin: process.env.FRONTEND_URL,
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin) || origin.startsWith("http://localhost:")) {
+            callback(null, true);
+        }
+        else {
+            callback(new Error("Not allowed by CORS"));
+        }
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -1846,6 +1872,13 @@ app.get("/api/properties/host/my-properties", verifyToken, verifyHostOrAdmin, as
 });
 // POST upload images → Cloudinary
 app.post("/api/properties/upload-images", verifyToken, verifyHostOrAdmin, upload.array("images", MAX_FILES), async (req, res) => {
+    if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+        res.status(500).json({
+            success: false,
+            message: "Cloudinary is not configured. Please set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in your .env file.",
+        });
+        return;
+    }
     try {
         // ✅ Fix 4: cast req.files to array (multer attaches it)
         const files = req.files || [];
@@ -3125,7 +3158,25 @@ app.post("/api/bookings", verifyToken, async (req, res) => {
             createdAt: now,
             updatedAt: now,
         };
-        // Atomic transaction — prevents double-booking race condition
+        // Check for existing pending booking by same guest, property, dates — idempotent
+        const existingBooking = await bookingsCol.findOne({
+            guestId: toIdString(user._id),
+            propertyId,
+            checkIn: checkInDate,
+            checkOut: checkOutDate,
+            status: "pending",
+        });
+        if (existingBooking) {
+            res.status(200).json({
+                success: true,
+                message: "Existing pending booking found.",
+                data: {
+                    booking: existingBooking,
+                },
+            });
+            return;
+        }
+        // Atomic transaction — prevents double-booking race condition with OTHER guests
         const session = client.startSession();
         let result;
         try {
@@ -3152,7 +3203,7 @@ app.post("/api/bookings", verifyToken, async (req, res) => {
         if (error?.message === "OVERLAP_CONFLICT") {
             res.status(409).json({
                 success: false,
-                message: "This property is already booked for the selected dates.",
+                message: "This property is already booked for the selected dates. If you already have a pending booking, please check your bookings page.",
             });
             return;
         }
@@ -3272,7 +3323,10 @@ app.get("/api/bookings/:id", verifyToken, async (req, res) => {
         const [guest, host, property] = await Promise.all([
             findUserById(usersCol, booking.guestId),
             findUserById(usersCol, booking.hostId),
-            propertiesCol.findOne({ _id: toObjectId(parseId(booking.propertyId)) }),
+            (() => {
+                const propId = toObjectId(parseId(booking.propertyId));
+                return propId ? propertiesCol.findOne({ _id: propId }) : Promise.resolve(null);
+            })(),
         ]);
         res.status(200).json({
             success: true,
@@ -3496,8 +3550,8 @@ app.put("/api/admin/bookings/:id/force-cancel", verifyToken, verifyAdmin, async 
 // ============================================================
 // PAYMENT INTENT ROUTE (embedded Elements flow)
 // ============================================================
-// POST create PaymentIntent for embedded card payment
-app.post("/api/payments/create-payment-intent", verifyToken, async (req, res) => {
+// POST create Checkout Session for Stripe Embedded Checkout
+app.post("/api/payments/create-checkout-session", verifyToken, async (req, res) => {
     if (!stripe) {
         res.status(503).json({ success: false, message: "Stripe not configured." });
         return;
@@ -3530,26 +3584,75 @@ app.post("/api/payments/create-payment-intent", verifyToken, async (req, res) =>
             res.status(400).json({ success: false, message: "Only pending bookings can be paid." });
             return;
         }
-        const paymentIntent = await stripe.paymentIntents.create({
-            amount: Math.round(booking.totalAmount * 100),
-            currency: (process.env.STRIPE_CURRENCY || "usd").toLowerCase(),
+        const currency = (process.env.STRIPE_CURRENCY || "usd").toLowerCase();
+        const session = await stripe.checkout.sessions.create({
+            ui_mode: "embedded_page",
+            line_items: [
+                {
+                    price_data: {
+                        currency,
+                        product_data: {
+                            name: booking.propertyTitle || "StayEase Booking",
+                            images: booking.propertyImage ? [booking.propertyImage] : [],
+                        },
+                        unit_amount: Math.round(booking.totalAmount * 100),
+                    },
+                    quantity: 1,
+                },
+            ],
+            mode: "payment",
+            return_url: `${FRONTEND_URL}/checkout/return?session_id={CHECKOUT_SESSION_ID}`,
             metadata: {
                 bookingId,
                 guestId: userId,
             },
-            description: `Booking at ${booking.propertyTitle || "StayEase property"}`,
         });
+        if (!session.client_secret) {
+            res.status(500).json({ success: false, message: "Failed to get client secret from Stripe." });
+            return;
+        }
         res.status(200).json({
             success: true,
             data: {
-                clientSecret: paymentIntent.client_secret,
-                paymentIntentId: paymentIntent.id,
+                clientSecret: session.client_secret,
             },
         });
     }
     catch (error) {
-        console.error("Create PaymentIntent error:", error);
-        res.status(500).json({ success: false, message: "Failed to create payment intent." });
+        console.error("Create checkout session error:", error);
+        res.status(500).json({ success: false, message: "Failed to create checkout session." });
+    }
+});
+// GET retrieve Checkout Session status
+app.get("/api/payments/session-status", async (req, res) => {
+    if (!stripe) {
+        res.status(503).json({ success: false, message: "Stripe not configured." });
+        return;
+    }
+    try {
+        const { session_id } = req.query;
+        if (!session_id || typeof session_id !== "string") {
+            res.status(400).json({ success: false, message: "session_id is required." });
+            return;
+        }
+        const session = await stripe.checkout.sessions.retrieve(session_id, {
+            expand: ["line_items", "payment_intent"],
+        });
+        res.status(200).json({
+            success: true,
+            data: {
+                status: session.status,
+                customer_email: session.customer_details?.email || null,
+                payment_status: session.payment_status,
+                amount_total: session.amount_total,
+                currency: session.currency,
+                bookingId: session.metadata?.bookingId || null,
+            },
+        });
+    }
+    catch (error) {
+        console.error("Session status error:", error);
+        res.status(500).json({ success: false, message: "Failed to retrieve session status." });
     }
 });
 // ============================================================
@@ -4174,8 +4277,19 @@ app.get("/api/wishlist/lists", verifyToken, async (req, res) => {
         const db = await getDb();
         const col = db.collection("wishlist");
         const userId = toIdString(req.user._id);
-        const lists = await col.distinct("listName", { userId, listName: { $ne: "" } });
-        res.status(200).json({ success: true, data: { lists: lists.filter(Boolean) } });
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+        const allLists = (await col.distinct("listName", { userId, listName: { $ne: "" } })).filter(Boolean);
+        const total = allLists.length;
+        const totalPages = Math.ceil(total / limit);
+        const paginatedLists = allLists.slice((page - 1) * limit, page * limit);
+        res.status(200).json({
+            success: true,
+            data: {
+                lists: paginatedLists,
+                pagination: { total, totalPages, currentPage: page, limit },
+            },
+        });
     }
     catch {
         res.status(500).json({ success: false, message: "Failed to fetch lists." });
@@ -4887,21 +5001,21 @@ app.get("/api/dashboard/guest", verifyToken, async (req, res) => {
         const [totalBookings, upcomingTrips, wishlistCount, totalSpentResult, upcomingBookings, recentTransactions, monthlySpendResult,] = await Promise.all([
             bookingsCol.countDocuments({ guestId: userId }),
             bookingsCol.countDocuments({ guestId: userId, status: "confirmed" }),
-            wishlistCol.countDocuments({ guestId: userId }),
+            wishlistCol.countDocuments({ userId }),
             transactionsCol.aggregate([
-                { $match: { guestId: userId, type: "payment", status: "success" } },
+                { $match: { userId, type: "payment", status: "success" } },
                 { $group: { _id: null, total: { $sum: "$amount" } } },
             ]).toArray(),
             bookingsCol.find({ guestId: userId, status: "confirmed" })
                 .sort({ checkIn: 1 })
                 .limit(5)
                 .toArray(),
-            transactionsCol.find({ guestId: userId })
+            transactionsCol.find({ userId })
                 .sort({ createdAt: -1 })
                 .limit(5)
                 .toArray(),
             transactionsCol.aggregate([
-                { $match: { guestId: userId, type: "payment", status: "success", createdAt: { $gte: startOfYear } } },
+                { $match: { userId, type: "payment", status: "success", createdAt: { $gte: startOfYear } } },
                 { $group: { _id: { $month: "$createdAt" }, total: { $sum: "$amount" } } },
                 { $sort: { _id: 1 } },
             ]).toArray(),
@@ -4945,10 +5059,13 @@ app.get("/api/dashboard/host", verifyToken, verifyHostOrAdmin, async (req, res) 
         const reviewsCol = db.collection("reviews");
         const now = new Date();
         const startOfYear = new Date(now.getFullYear(), 0, 1);
+        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+        const startOfNextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+        const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
         const hostProperties = await propertiesCol.find({ hostId: userId }).toArray();
         const propertyIds = hostProperties.map((p) => p._id);
         const totalProperties = hostProperties.length;
-        const [activeBookings, pendingBookings, reviewsResult, totalIncomeResult, monthlyIncomeResult, recentReservations,] = await Promise.all([
+        const [activeBookings, pendingBookings, reviewsResult, totalIncomeResult, monthlyIncomeResult, recentReservations, occupancyResult,] = await Promise.all([
             bookingsCol.countDocuments({ hostId: userId, status: "confirmed" }),
             bookingsCol.find({ hostId: userId, status: "pending" })
                 .sort({ createdAt: -1 })
@@ -4959,11 +5076,11 @@ app.get("/api/dashboard/host", verifyToken, verifyHostOrAdmin, async (req, res) 
                 { $group: { _id: null, avg: { $avg: "$rating" }, count: { $sum: 1 } } },
             ]).toArray(),
             transactionsCol.aggregate([
-                { $match: { hostId: userId, type: "payout", status: "success" } },
+                { $match: { userId, type: "payout", status: "success" } },
                 { $group: { _id: null, total: { $sum: "$amount" } } },
             ]).toArray(),
             transactionsCol.aggregate([
-                { $match: { hostId: userId, type: "payout", status: "success", createdAt: { $gte: startOfYear } } },
+                { $match: { userId, type: "payout", status: "success", createdAt: { $gte: startOfYear } } },
                 { $group: { _id: { $month: "$createdAt" }, total: { $sum: "$amount" } } },
                 { $sort: { _id: 1 } },
             ]).toArray(),
@@ -4971,6 +5088,11 @@ app.get("/api/dashboard/host", verifyToken, verifyHostOrAdmin, async (req, res) 
                 .sort({ createdAt: -1 })
                 .limit(5)
                 .toArray(),
+            bookingsCol.aggregate([
+                { $match: { hostId: userId, status: { $in: ["confirmed", "completed"] }, checkIn: { $lt: startOfNextMonth }, checkOut: { $gt: startOfMonth } } },
+                { $project: { nightsInMonth: { $ceil: { $divide: [{ $subtract: [{ $min: ["$checkOut", startOfNextMonth] }, { $max: ["$checkIn", startOfMonth] }] }, 86400000] } } } },
+                { $group: { _id: null, totalBookedNights: { $sum: "$nightsInMonth" } } },
+            ]).toArray(),
         ]);
         const averageRating = reviewsResult.length > 0 ? Math.round(reviewsResult[0].avg * 10) / 10 : 0;
         const totalReviews = reviewsResult.length > 0 ? reviewsResult[0].count : 0;
@@ -4988,8 +5110,9 @@ app.get("/api/dashboard/host", verifyToken, verifyHostOrAdmin, async (req, res) 
         const thisMonthIncome = monthlyIncome[now.getMonth()].income;
         const totalConfirmed = activeBookings;
         const totalPendings = pendingBookings.length;
-        const occupancyRate = totalProperties > 0
-            ? Math.round(((totalPendings + totalConfirmed) / totalProperties) * 100)
+        const totalBookedNights = occupancyResult.length > 0 ? occupancyResult[0].totalBookedNights : 0;
+        const occupancyRate = totalProperties > 0 && daysInMonth > 0
+            ? Math.round((totalBookedNights / (totalProperties * daysInMonth)) * 100)
             : 0;
         res.status(200).json({
             success: true,
@@ -5019,9 +5142,10 @@ app.get("/api/dashboard/admin", verifyToken, verifyAdmin, async (req, res) => {
         const bookingsCol = db.collection("bookings");
         const transactionsCol = db.collection("transactions");
         const usersCol = db.collection("user");
+        const reviewsCol = db.collection("reviews");
         const now = new Date();
         const startOfYear = new Date(now.getFullYear(), 0, 1);
-        const [totalUsers, totalProperties, totalBookings, statsResult, recentBookings, signupsResult, bookingsByStatus, propertiesByCategory,] = await Promise.all([
+        const [totalUsers, totalProperties, totalBookings, statsResult, recentBookings, signupsResult, bookingsByStatus, propertiesByCategory, reportedReviews,] = await Promise.all([
             usersCol.countDocuments(),
             propertiesCol.countDocuments(),
             bookingsCol.countDocuments(),
@@ -5042,6 +5166,7 @@ app.get("/api/dashboard/admin", verifyToken, verifyAdmin, async (req, res) => {
                 { $group: { _id: "$category", count: { $sum: 1 } } },
                 { $sort: { count: -1 } },
             ]).toArray(),
+            reviewsCol.countDocuments({ isReported: true }),
         ]);
         const commissionEarned = statsResult.length > 0 ? statsResult[0].commission : 0;
         const pendingPayouts = statsResult.length > 0 ? statsResult[0].pending : 0;
@@ -5075,6 +5200,7 @@ app.get("/api/dashboard/admin", verifyToken, verifyAdmin, async (req, res) => {
                 signupTrend,
                 bookingStatusData,
                 categoryData,
+                reportedReviews,
             },
         });
     }
