@@ -581,7 +581,12 @@ const VALID_CATEGORIES = [
     "hotel",
     "apartment",
     "villa",
+    "suite",
+    "cabin",
+    "event",
     "event-space",
+    "estate",
+    "resort",
 ];
 const VALID_STATUSES = [
     "active",
@@ -2098,6 +2103,49 @@ app.get("/api/properties", async (req, res) => {
             success: false,
             message: "Failed to fetch properties.",
         });
+    }
+});
+// GET popular destinations (city aggregation with first property image)
+app.get("/api/properties/cities", async (_req, res) => {
+    try {
+        const db = await getDb();
+        const col = db.collection("properties");
+        const pipeline = [
+            { $match: { status: "active", "location.city": { $exists: true, $ne: "" } } },
+            {
+                $group: {
+                    _id: { $trim: { input: { $toLower: "$location.city" } } },
+                    country: { $first: "$location.country" },
+                    count: { $sum: 1 },
+                    image: {
+                        $first: {
+                            $cond: {
+                                if: { $gt: [{ $size: { $ifNull: ["$images", []] } }, 0] },
+                                then: { $arrayElemAt: ["$images", 0] },
+                                else: null,
+                            },
+                        },
+                    },
+                },
+            },
+            { $sort: { count: -1 } },
+            { $limit: 8 },
+            {
+                $project: {
+                    _id: 0,
+                    city: { $concat: [{ $toUpper: { $substrCP: ["$_id", 0, 1] } }, { $substrCP: ["$_id", 1, { $subtract: [{ $strLenCP: "$_id" }, 1] }] }] },
+                    country: 1,
+                    count: 1,
+                    image: 1,
+                },
+            },
+        ];
+        const cities = await col.aggregate(pipeline).toArray();
+        res.status(200).json({ success: true, data: cities });
+    }
+    catch (error) {
+        console.error("Cities aggregation error:", error);
+        res.status(500).json({ success: false, message: "Failed to fetch destinations." });
     }
 });
 // POST create property (host/admin)
@@ -4821,6 +4869,217 @@ app.put("/api/conversations/:id/read-all", verifyToken, async (req, res) => {
     }
     catch {
         res.status(500).json({ success: false, message: "Failed to mark messages as read." });
+    }
+});
+// ============================================================
+// DASHBOARD CONSOLIDATED ENDPOINTS
+// ============================================================
+// GET /api/dashboard/guest — consolidated guest dashboard data
+app.get("/api/dashboard/guest", verifyToken, async (req, res) => {
+    try {
+        const db = await getDb();
+        const userId = toIdString(req.user._id);
+        const bookingsCol = db.collection("bookings");
+        const transactionsCol = db.collection("transactions");
+        const wishlistCol = db.collection("wishlist");
+        const now = new Date();
+        const startOfYear = new Date(now.getFullYear(), 0, 1);
+        const [totalBookings, upcomingTrips, wishlistCount, totalSpentResult, upcomingBookings, recentTransactions, monthlySpendResult,] = await Promise.all([
+            bookingsCol.countDocuments({ guestId: userId }),
+            bookingsCol.countDocuments({ guestId: userId, status: "confirmed" }),
+            wishlistCol.countDocuments({ guestId: userId }),
+            transactionsCol.aggregate([
+                { $match: { guestId: userId, type: "payment", status: "success" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray(),
+            bookingsCol.find({ guestId: userId, status: "confirmed" })
+                .sort({ checkIn: 1 })
+                .limit(5)
+                .toArray(),
+            transactionsCol.find({ guestId: userId })
+                .sort({ createdAt: -1 })
+                .limit(5)
+                .toArray(),
+            transactionsCol.aggregate([
+                { $match: { guestId: userId, type: "payment", status: "success", createdAt: { $gte: startOfYear } } },
+                { $group: { _id: { $month: "$createdAt" }, total: { $sum: "$amount" } } },
+                { $sort: { _id: 1 } },
+            ]).toArray(),
+        ]);
+        const totalSpent = totalSpentResult.length > 0 ? totalSpentResult[0].total : 0;
+        const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        const monthlySpend = Array.from({ length: 12 }, (_, i) => ({
+            month: MONTHS[i],
+            spend: 0,
+        }));
+        monthlySpendResult.forEach((r) => {
+            if (r._id >= 1 && r._id <= 12) {
+                monthlySpend[r._id - 1].spend = r.total;
+            }
+        });
+        res.status(200).json({
+            success: true,
+            data: {
+                totalBookings,
+                upcomingTrips,
+                wishlistCount,
+                totalSpent,
+                upcomingBookings,
+                recentTransactions,
+                monthlySpend,
+            },
+        });
+    }
+    catch {
+        res.status(500).json({ success: false, message: "Failed to fetch guest dashboard." });
+    }
+});
+// GET /api/dashboard/host — consolidated host dashboard data
+app.get("/api/dashboard/host", verifyToken, verifyHostOrAdmin, async (req, res) => {
+    try {
+        const db = await getDb();
+        const userId = toIdString(req.user._id);
+        const propertiesCol = db.collection("properties");
+        const bookingsCol = db.collection("bookings");
+        const transactionsCol = db.collection("transactions");
+        const reviewsCol = db.collection("reviews");
+        const now = new Date();
+        const startOfYear = new Date(now.getFullYear(), 0, 1);
+        const hostProperties = await propertiesCol.find({ hostId: userId }).toArray();
+        const propertyIds = hostProperties.map((p) => p._id);
+        const totalProperties = hostProperties.length;
+        const [activeBookings, pendingBookings, reviewsResult, totalIncomeResult, monthlyIncomeResult, recentReservations,] = await Promise.all([
+            bookingsCol.countDocuments({ hostId: userId, status: "confirmed" }),
+            bookingsCol.find({ hostId: userId, status: "pending" })
+                .sort({ createdAt: -1 })
+                .limit(5)
+                .toArray(),
+            reviewsCol.aggregate([
+                { $match: { hostId: userId } },
+                { $group: { _id: null, avg: { $avg: "$rating" }, count: { $sum: 1 } } },
+            ]).toArray(),
+            transactionsCol.aggregate([
+                { $match: { hostId: userId, type: "payout", status: "success" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray(),
+            transactionsCol.aggregate([
+                { $match: { hostId: userId, type: "payout", status: "success", createdAt: { $gte: startOfYear } } },
+                { $group: { _id: { $month: "$createdAt" }, total: { $sum: "$amount" } } },
+                { $sort: { _id: 1 } },
+            ]).toArray(),
+            bookingsCol.find({ hostId: userId })
+                .sort({ createdAt: -1 })
+                .limit(5)
+                .toArray(),
+        ]);
+        const averageRating = reviewsResult.length > 0 ? Math.round(reviewsResult[0].avg * 10) / 10 : 0;
+        const totalReviews = reviewsResult.length > 0 ? reviewsResult[0].count : 0;
+        const totalIncome = totalIncomeResult.length > 0 ? totalIncomeResult[0].total : 0;
+        const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        const monthlyIncome = Array.from({ length: 12 }, (_, i) => ({
+            month: MONTHS[i],
+            income: 0,
+        }));
+        monthlyIncomeResult.forEach((r) => {
+            if (r._id >= 1 && r._id <= 12) {
+                monthlyIncome[r._id - 1].income = r.total;
+            }
+        });
+        const thisMonthIncome = monthlyIncome[now.getMonth()].income;
+        const totalConfirmed = activeBookings;
+        const totalPendings = pendingBookings.length;
+        const occupancyRate = totalProperties > 0
+            ? Math.round(((totalPendings + totalConfirmed) / totalProperties) * 100)
+            : 0;
+        res.status(200).json({
+            success: true,
+            data: {
+                totalProperties,
+                activeBookings,
+                thisMonthIncome,
+                occupancyRate,
+                averageRating,
+                totalReviews,
+                totalIncome,
+                pendingBookings,
+                recentReservations,
+                monthlyIncome,
+            },
+        });
+    }
+    catch {
+        res.status(500).json({ success: false, message: "Failed to fetch host dashboard." });
+    }
+});
+// GET /api/dashboard/admin — consolidated admin dashboard data
+app.get("/api/dashboard/admin", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const db = await getDb();
+        const propertiesCol = db.collection("properties");
+        const bookingsCol = db.collection("bookings");
+        const transactionsCol = db.collection("transactions");
+        const usersCol = db.collection("user");
+        const now = new Date();
+        const startOfYear = new Date(now.getFullYear(), 0, 1);
+        const [totalUsers, totalProperties, totalBookings, statsResult, recentBookings, signupsResult, bookingsByStatus, propertiesByCategory,] = await Promise.all([
+            usersCol.countDocuments(),
+            propertiesCol.countDocuments(),
+            bookingsCol.countDocuments(),
+            transactionsCol.aggregate([
+                { $match: { type: "payment", status: "success" } },
+                { $group: { _id: null, commission: { $sum: "$platformFee" }, pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, "$amount", 0] } } } },
+            ]).toArray(),
+            bookingsCol.find().sort({ createdAt: -1 }).limit(5).toArray(),
+            usersCol.aggregate([
+                { $match: { createdAt: { $gte: startOfYear } } },
+                { $group: { _id: { $month: "$createdAt" }, count: { $sum: 1 } } },
+                { $sort: { _id: 1 } },
+            ]).toArray(),
+            bookingsCol.aggregate([
+                { $group: { _id: "$status", count: { $sum: 1 } } },
+            ]).toArray(),
+            propertiesCol.aggregate([
+                { $group: { _id: "$category", count: { $sum: 1 } } },
+                { $sort: { count: -1 } },
+            ]).toArray(),
+        ]);
+        const commissionEarned = statsResult.length > 0 ? statsResult[0].commission : 0;
+        const pendingPayouts = statsResult.length > 0 ? statsResult[0].pending : 0;
+        const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        const signupTrend = Array.from({ length: 12 }, (_, i) => ({
+            month: MONTHS[i],
+            signups: 0,
+        }));
+        signupsResult.forEach((r) => {
+            if (r._id >= 1 && r._id <= 12) {
+                signupTrend[r._id - 1].signups = r.count;
+            }
+        });
+        const bookingStatusData = bookingsByStatus.map((r) => ({
+            name: r._id,
+            count: r.count,
+        }));
+        const categoryData = propertiesByCategory.map((r) => ({
+            name: r._id,
+            count: r.count,
+        }));
+        res.status(200).json({
+            success: true,
+            data: {
+                totalUsers,
+                totalProperties,
+                totalBookings,
+                commissionEarned,
+                pendingPayouts,
+                recentBookings,
+                signupTrend,
+                bookingStatusData,
+                categoryData,
+            },
+        });
+    }
+    catch {
+        res.status(500).json({ success: false, message: "Failed to fetch admin dashboard." });
     }
 });
 // ============================================================

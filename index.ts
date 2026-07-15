@@ -4066,7 +4066,26 @@ app.post(
                 updatedAt: now,
             };
 
-            // Atomic transaction — prevents double-booking race condition
+            // Check for existing pending booking by same guest, property, dates — idempotent
+            const existingBooking = await bookingsCol.findOne({
+                guestId: toIdString(user._id),
+                propertyId,
+                checkIn: checkInDate,
+                checkOut: checkOutDate,
+                status: "pending",
+            }) as any;
+            if (existingBooking) {
+                res.status(200).json({
+                    success: true,
+                    message: "Existing pending booking found.",
+                    data: {
+                        booking: existingBooking,
+                    },
+                });
+                return;
+            }
+
+            // Atomic transaction — prevents double-booking race condition with OTHER guests
             const session = client.startSession();
             let result;
             try {
@@ -4095,7 +4114,7 @@ app.post(
             if (error?.message === "OVERLAP_CONFLICT") {
                 res.status(409).json({
                     success: false,
-                    message: "This property is already booked for the selected dates.",
+                    message: "This property is already booked for the selected dates. If you already have a pending booking, please check your bookings page.",
                 });
                 return;
             }
@@ -4535,9 +4554,9 @@ app.put(
 // PAYMENT INTENT ROUTE (embedded Elements flow)
 // ============================================================
 
-// POST create PaymentIntent for embedded card payment
+// POST create Checkout Session for Stripe Embedded Checkout
 app.post(
-    "/api/payments/create-payment-intent",
+    "/api/payments/create-checkout-session",
     verifyToken,
     async (req: AuthRequest, res: Response): Promise<void> => {
         if (!stripe) {
@@ -4580,26 +4599,84 @@ app.post(
                 return;
             }
 
-            const paymentIntent = await stripe.paymentIntents.create({
-                amount: Math.round(booking.totalAmount * 100),
-                currency: (process.env.STRIPE_CURRENCY || "usd").toLowerCase(),
+            const currency = (process.env.STRIPE_CURRENCY || "usd").toLowerCase();
+
+            const session = await stripe.checkout.sessions.create({
+                ui_mode: "embedded_page",
+                line_items: [
+                    {
+                        price_data: {
+                            currency,
+                            product_data: {
+                                name: booking.propertyTitle || "StayEase Booking",
+                                images: booking.propertyImage ? [booking.propertyImage] : [],
+                            },
+                            unit_amount: Math.round(booking.totalAmount * 100),
+                        },
+                        quantity: 1,
+                    },
+                ],
+                mode: "payment",
+                return_url: `${FRONTEND_URL}/checkout/return?session_id={CHECKOUT_SESSION_ID}`,
                 metadata: {
                     bookingId,
                     guestId: userId,
                 },
-                description: `Booking at ${booking.propertyTitle || "StayEase property"}`,
+            });
+
+            if (!session.client_secret) {
+                res.status(500).json({ success: false, message: "Failed to get client secret from Stripe." });
+                return;
+            }
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    clientSecret: session.client_secret,
+                },
+            });
+        } catch (error: any) {
+            console.error("Create checkout session error:", error);
+            res.status(500).json({ success: false, message: "Failed to create checkout session." });
+        }
+    },
+);
+
+// GET retrieve Checkout Session status
+app.get(
+    "/api/payments/session-status",
+    async (req: Request, res: Response): Promise<void> => {
+        if (!stripe) {
+            res.status(503).json({ success: false, message: "Stripe not configured." });
+            return;
+        }
+
+        try {
+            const { session_id } = req.query;
+
+            if (!session_id || typeof session_id !== "string") {
+                res.status(400).json({ success: false, message: "session_id is required." });
+                return;
+            }
+
+            const session = await stripe.checkout.sessions.retrieve(session_id, {
+                expand: ["line_items", "payment_intent"],
             });
 
             res.status(200).json({
                 success: true,
                 data: {
-                    clientSecret: paymentIntent.client_secret,
-                    paymentIntentId: paymentIntent.id,
+                    status: session.status,
+                    customer_email: session.customer_details?.email || null,
+                    payment_status: session.payment_status,
+                    amount_total: session.amount_total,
+                    currency: session.currency,
+                    bookingId: session.metadata?.bookingId || null,
                 },
             });
         } catch (error: any) {
-            console.error("Create PaymentIntent error:", error);
-            res.status(500).json({ success: false, message: "Failed to create payment intent." });
+            console.error("Session status error:", error);
+            res.status(500).json({ success: false, message: "Failed to retrieve session status." });
         }
     },
 );
@@ -6240,6 +6317,278 @@ app.put(
             res.status(200).json({ success: true, message: "All messages marked as read." });
         } catch {
             res.status(500).json({ success: false, message: "Failed to mark messages as read." });
+        }
+    },
+);
+
+// ============================================================
+// DASHBOARD CONSOLIDATED ENDPOINTS
+// ============================================================
+
+// GET /api/dashboard/guest — consolidated guest dashboard data
+app.get(
+    "/api/dashboard/guest",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const userId = toIdString(req.user!._id);
+
+            const bookingsCol = db.collection("bookings");
+            const transactionsCol = db.collection("transactions");
+            const wishlistCol = db.collection("wishlist");
+
+            const now = new Date();
+            const startOfYear = new Date(now.getFullYear(), 0, 1);
+
+            const [
+                totalBookings,
+                upcomingTrips,
+                wishlistCount,
+                totalSpentResult,
+                upcomingBookings,
+                recentTransactions,
+                monthlySpendResult,
+            ] = await Promise.all([
+                bookingsCol.countDocuments({ guestId: userId }),
+                bookingsCol.countDocuments({ guestId: userId, status: "confirmed" }),
+                wishlistCol.countDocuments({ userId }),
+                transactionsCol.aggregate([
+                    { $match: { userId, type: "payment", status: "success" } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).toArray(),
+                bookingsCol.find({ guestId: userId, status: "confirmed" })
+                    .sort({ checkIn: 1 })
+                    .limit(5)
+                    .toArray(),
+                transactionsCol.find({ userId })
+                    .sort({ createdAt: -1 })
+                    .limit(5)
+                    .toArray(),
+                transactionsCol.aggregate([
+                    { $match: { userId, type: "payment", status: "success", createdAt: { $gte: startOfYear } } },
+                    { $group: { _id: { $month: "$createdAt" }, total: { $sum: "$amount" } } },
+                    { $sort: { _id: 1 } },
+                ]).toArray(),
+            ]);
+
+            const totalSpent = totalSpentResult.length > 0 ? totalSpentResult[0].total : 0;
+            const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            const monthlySpend = Array.from({ length: 12 }, (_, i) => ({
+                month: MONTHS[i],
+                spend: 0,
+            }));
+            monthlySpendResult.forEach((r: any) => {
+                if (r._id >= 1 && r._id <= 12) {
+                    monthlySpend[r._id - 1].spend = r.total;
+                }
+            });
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    totalBookings,
+                    upcomingTrips,
+                    wishlistCount,
+                    totalSpent,
+                    upcomingBookings,
+                    recentTransactions,
+                    monthlySpend,
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch guest dashboard." });
+        }
+    },
+);
+
+// GET /api/dashboard/host — consolidated host dashboard data
+app.get(
+    "/api/dashboard/host",
+    verifyToken,
+    verifyHostOrAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const userId = toIdString(req.user!._id);
+
+            const propertiesCol = db.collection("properties");
+            const bookingsCol = db.collection("bookings");
+            const transactionsCol = db.collection("transactions");
+            const reviewsCol = db.collection("reviews");
+
+            const now = new Date();
+            const startOfYear = new Date(now.getFullYear(), 0, 1);
+
+            const hostProperties = await propertiesCol.find({ hostId: userId }).toArray();
+            const propertyIds = hostProperties.map((p: any) => p._id);
+
+            const totalProperties = hostProperties.length;
+
+            const [
+                activeBookings,
+                pendingBookings,
+                reviewsResult,
+                totalIncomeResult,
+                monthlyIncomeResult,
+                recentReservations,
+            ] = await Promise.all([
+                bookingsCol.countDocuments({ hostId: userId, status: "confirmed" }),
+                bookingsCol.find({ hostId: userId, status: "pending" })
+                    .sort({ createdAt: -1 })
+                    .limit(5)
+                    .toArray(),
+                reviewsCol.aggregate([
+                    { $match: { hostId: userId } },
+                    { $group: { _id: null, avg: { $avg: "$rating" }, count: { $sum: 1 } } },
+                ]).toArray(),
+                transactionsCol.aggregate([
+                    { $match: { userId, type: "payout", status: "success" } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).toArray(),
+                transactionsCol.aggregate([
+                    { $match: { userId, type: "payout", status: "success", createdAt: { $gte: startOfYear } } },
+                    { $group: { _id: { $month: "$createdAt" }, total: { $sum: "$amount" } } },
+                    { $sort: { _id: 1 } },
+                ]).toArray(),
+                bookingsCol.find({ hostId: userId })
+                    .sort({ createdAt: -1 })
+                    .limit(5)
+                    .toArray(),
+            ]);
+
+            const averageRating = reviewsResult.length > 0 ? Math.round(reviewsResult[0].avg * 10) / 10 : 0;
+            const totalReviews = reviewsResult.length > 0 ? reviewsResult[0].count : 0;
+            const totalIncome = totalIncomeResult.length > 0 ? totalIncomeResult[0].total : 0;
+
+            const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            const monthlyIncome = Array.from({ length: 12 }, (_, i) => ({
+                month: MONTHS[i],
+                income: 0,
+            }));
+            monthlyIncomeResult.forEach((r: any) => {
+                if (r._id >= 1 && r._id <= 12) {
+                    monthlyIncome[r._id - 1].income = r.total;
+                }
+            });
+
+            const thisMonthIncome = monthlyIncome[now.getMonth()].income;
+
+            const totalConfirmed = activeBookings;
+            const totalPendings = pendingBookings.length;
+            const occupancyRate = totalProperties > 0
+                ? Math.round(((totalPendings + totalConfirmed) / totalProperties) * 100)
+                : 0;
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    totalProperties,
+                    activeBookings,
+                    thisMonthIncome,
+                    occupancyRate,
+                    averageRating,
+                    totalReviews,
+                    totalIncome,
+                    pendingBookings,
+                    recentReservations,
+                    monthlyIncome,
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch host dashboard." });
+        }
+    },
+);
+
+// GET /api/dashboard/admin — consolidated admin dashboard data
+app.get(
+    "/api/dashboard/admin",
+    verifyToken,
+    verifyAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const propertiesCol = db.collection("properties");
+            const bookingsCol = db.collection("bookings");
+            const transactionsCol = db.collection("transactions");
+            const usersCol = db.collection("user");
+
+            const now = new Date();
+            const startOfYear = new Date(now.getFullYear(), 0, 1);
+
+            const [
+                totalUsers,
+                totalProperties,
+                totalBookings,
+                statsResult,
+                recentBookings,
+                signupsResult,
+                bookingsByStatus,
+                propertiesByCategory,
+            ] = await Promise.all([
+                usersCol.countDocuments(),
+                propertiesCol.countDocuments(),
+                bookingsCol.countDocuments(),
+                transactionsCol.aggregate([
+                    { $match: { type: "payment", status: "success" } },
+                    { $group: { _id: null, commission: { $sum: "$platformFee" }, pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, "$amount", 0] } } } },
+                ]).toArray(),
+                bookingsCol.find().sort({ createdAt: -1 }).limit(5).toArray(),
+                usersCol.aggregate([
+                    { $match: { createdAt: { $gte: startOfYear } } },
+                    { $group: { _id: { $month: "$createdAt" }, count: { $sum: 1 } } },
+                    { $sort: { _id: 1 } },
+                ]).toArray(),
+                bookingsCol.aggregate([
+                    { $group: { _id: "$status", count: { $sum: 1 } } },
+                ]).toArray(),
+                propertiesCol.aggregate([
+                    { $group: { _id: "$category", count: { $sum: 1 } } },
+                    { $sort: { count: -1 } },
+                ]).toArray(),
+            ]);
+
+            const commissionEarned = statsResult.length > 0 ? statsResult[0].commission : 0;
+            const pendingPayouts = statsResult.length > 0 ? statsResult[0].pending : 0;
+
+            const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            const signupTrend = Array.from({ length: 12 }, (_, i) => ({
+                month: MONTHS[i],
+                signups: 0,
+            }));
+            signupsResult.forEach((r: any) => {
+                if (r._id >= 1 && r._id <= 12) {
+                    signupTrend[r._id - 1].signups = r.count;
+                }
+            });
+
+            const bookingStatusData = bookingsByStatus.map((r: any) => ({
+                name: r._id,
+                count: r.count,
+            }));
+
+            const categoryData = propertiesByCategory.map((r: any) => ({
+                name: r._id,
+                count: r.count,
+            }));
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    totalUsers,
+                    totalProperties,
+                    totalBookings,
+                    commissionEarned,
+                    pendingPayouts,
+                    recentBookings,
+                    signupTrend,
+                    bookingStatusData,
+                    categoryData,
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch admin dashboard." });
         }
     },
 );
