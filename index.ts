@@ -331,7 +331,7 @@ interface AvailabilityDate {
     reason?: string;
 }
 
-type PropertyCategory = "hotel" | "apartment" | "villa" | "event-space";
+type PropertyCategory = "hotel" | "apartment" | "villa" | "suite" | "cabin" | "event" | "event-space" | "estate" | "resort";
 type PropertyStatus =
     | "active"
     | "inactive"
@@ -1027,7 +1027,12 @@ const VALID_CATEGORIES: PropertyCategory[] = [
     "hotel",
     "apartment",
     "villa",
+    "suite",
+    "cabin",
+    "event",
     "event-space",
+    "estate",
+    "resort",
 ];
 const VALID_STATUSES: PropertyStatus[] = [
     "active",
@@ -2825,6 +2830,55 @@ app.get(
                 success: false,
                 message: "Failed to fetch properties.",
             });
+        }
+    },
+);
+
+// GET popular destinations (city aggregation with first property image)
+app.get(
+    "/api/properties/cities",
+    async (_req: Request, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const col = db.collection("properties");
+
+            const pipeline = [
+                { $match: { status: "active", "location.city": { $exists: true, $ne: "" } } },
+                {
+                    $group: {
+                        _id: { $trim: { input: { $toLower: "$location.city" } } },
+                        country: { $first: "$location.country" },
+                        count: { $sum: 1 },
+                        image: {
+                            $first: {
+                                $cond: {
+                                    if: { $gt: [{ $size: { $ifNull: ["$images", []] } }, 0] },
+                                    then: { $arrayElemAt: ["$images", 0] },
+                                    else: null,
+                                },
+                            },
+                        },
+                    },
+                },
+                { $sort: { count: -1 } },
+                { $limit: 8 },
+                {
+                    $project: {
+                        _id: 0,
+                        city: { $concat: [{ $toUpper: { $substrCP: ["$_id", 0, 1] } }, { $substrCP: ["$_id", 1, { $subtract: [{ $strLenCP: "$_id" }, 1] }] }] },
+                        country: 1,
+                        count: 1,
+                        image: 1,
+                    },
+                },
+            ];
+
+            const cities = await col.aggregate(pipeline).toArray();
+
+            res.status(200).json({ success: true, data: cities });
+        } catch (error) {
+            console.error("Cities aggregation error:", error);
+            res.status(500).json({ success: false, message: "Failed to fetch destinations." });
         }
     },
 );
