@@ -283,16 +283,27 @@ const upload = multer({
 interface PropertyLocation {
     address: string;
     city: string;
+    state?: string;
     country: string;
+    zipCode?: string;
     coordinates?: { lat: number; lng: number };
 }
 
 interface PropertyPrice {
     perNight: number;
+    currency?: string;
     weeklyDiscount?: number;
     monthlyDiscount?: number;
     cleaningFee?: number;
     serviceFee?: number;
+}
+
+interface AvailabilitySettings {
+    minStay: number;
+    maxStay: number;
+    advanceNotice: number;
+    availableFrom: string;
+    availableTo: string;
 }
 
 interface PropertyDetails {
@@ -348,7 +359,13 @@ type AmenityType =
     | "security-camera"
     | "smoke-alarm"
     | "first-aid"
-    | "fire-extinguisher";
+    | "fire-extinguisher"
+    | "hot-water"
+    | "refrigerator"
+    | "lock"
+    | "pet-friendly"
+    | "baby-friendly"
+    | "wheelchair-accessible";
 
 interface PropertyDoc {
     _id?: ObjectId;
@@ -356,6 +373,7 @@ interface PropertyDoc {
     title: string;
     description: string;
     category: PropertyCategory;
+    placeType?: string;
     location: PropertyLocation;
     price: PropertyPrice;
     details: PropertyDetails;
@@ -363,6 +381,7 @@ interface PropertyDoc {
     images: string[];
     houseRules: HouseRules;
     availability: AvailabilityDate[];
+    availabilitySettings?: AvailabilitySettings;
     status: PropertyStatus;
     rating: number;
     reviewCount: number;
@@ -444,12 +463,14 @@ type ValidatedPropertyData = {
     title: string;
     description: string;
     category: PropertyCategory;
+    placeType?: string;
     location: PropertyLocation;
     price: PropertyPrice;
     details: PropertyDetails;
     amenities: AmenityType[];
     images: string[];
     houseRules: HouseRules;
+    availabilitySettings?: AvailabilitySettings;
 };
 
 interface AuthUser {
@@ -1037,6 +1058,12 @@ const VALID_AMENITIES: AmenityType[] = [
     "smoke-alarm",
     "first-aid",
     "fire-extinguisher",
+    "hot-water",
+    "refrigerator",
+    "lock",
+    "pet-friendly",
+    "baby-friendly",
+    "wheelchair-accessible",
 ];
 
 function validatePropertyInput(body: any): {
@@ -1048,12 +1075,14 @@ function validatePropertyInput(body: any): {
         title,
         description,
         category,
+        placeType,
         location,
         price,
         details,
         amenities,
         images,
         houseRules,
+        availabilitySettings,
         status,
     } = body;
 
@@ -1222,10 +1251,19 @@ function validatePropertyInput(body: any): {
         title: title.trim(),
         description: description.trim(),
         category: category as PropertyCategory,
+        ...(placeType !== undefined && {
+            placeType: String(placeType).trim(),
+        }),
         location: {
             address: String(location.address).trim(),
             city: String(location.city).trim(),
+            ...(location.state !== undefined && {
+                state: String(location.state).trim(),
+            }),
             country: String(location.country).trim(),
+            ...(location.zipCode !== undefined && {
+                zipCode: String(location.zipCode).trim(),
+            }),
             ...(location.coordinates && {
                 coordinates: {
                     lat: Number(location.coordinates.lat),
@@ -1235,6 +1273,9 @@ function validatePropertyInput(body: any): {
         },
         price: {
             perNight,
+            ...(price.currency !== undefined && {
+                currency: String(price.currency).trim(),
+            }),
             ...(price.weeklyDiscount !== undefined && {
                 weeklyDiscount: Number(price.weeklyDiscount),
             }),
@@ -1276,13 +1317,22 @@ function validatePropertyInput(body: any): {
                       ) as string[],
                   }),
               }
-            : {
-                  smokingAllowed: false,
-                  petsAllowed: false,
-                  partiesAllowed: false,
-                  checkInTime: "14:00",
-                  checkOutTime: "11:00",
-              },
+              : {
+                    smokingAllowed: false,
+                    petsAllowed: false,
+                    partiesAllowed: false,
+                    checkInTime: "14:00",
+                    checkOutTime: "11:00",
+                },
+        ...(availabilitySettings !== undefined && {
+            availabilitySettings: {
+                minStay: Number(availabilitySettings.minStay) || 1,
+                maxStay: Number(availabilitySettings.maxStay) || 30,
+                advanceNotice: Number(availabilitySettings.advanceNotice) || 1,
+                availableFrom: String(availabilitySettings.availableFrom || ""),
+                availableTo: String(availabilitySettings.availableTo || ""),
+            },
+        }),
     };
 
     return { valid: true, data };
@@ -1296,6 +1346,7 @@ function buildPropertyResponse(p: any) {
         title: p.title,
         description: p.description,
         category: p.category,
+        placeType: p.placeType || null,
         location: p.location,
         price: p.price,
         details: p.details,
@@ -1303,6 +1354,7 @@ function buildPropertyResponse(p: any) {
         images: p.images || [],
         houseRules: p.houseRules,
         availability: p.availability || [],
+        availabilitySettings: p.availabilitySettings || null,
         status: p.status,
         rating: p.rating ?? 0,
         reviewCount: p.reviewCount ?? 0,

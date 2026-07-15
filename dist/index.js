@@ -63,12 +63,13 @@ async function stripeWebhookHandler(req, res) {
     }
     try {
         const db = await getDb();
+        const client = await getClientPromise();
         const bookingsCol = db.collection("bookings");
         const transactionsCol = db.collection("transactions");
         switch (event.type) {
             case "checkout.session.completed": {
-                const session = event.data.object;
-                const bookingId = session.metadata?.bookingId;
+                const stripeSession = event.data.object;
+                const bookingId = stripeSession.metadata?.bookingId;
                 if (!bookingId) {
                     console.warn("Webhook: No bookingId in session metadata");
                     res.status(200).json({ received: true });
@@ -86,29 +87,34 @@ async function stripeWebhookHandler(req, res) {
                     res.status(200).json({ received: true });
                     return;
                 }
-                // Idempotency check — prevent duplicate webhook processing
-                const idempotencyKey = `stripe_${session.id}`;
-                const existingTxn = await transactionsCol.findOne({ transactionId: idempotencyKey });
-                if (existingTxn) {
-                    console.log(`Webhook: Session ${session.id} already processed, skipping`);
+                const idempotencyKey = `stripe_${stripeSession.id}`;
+                await confirmBookingAndCreateTransaction(bookingsCol, transactionsCol, client, bookingId, booking, idempotencyKey, stripeSession.currency || process.env.STRIPE_CURRENCY || "usd");
+                console.log(`✅ Booking ${bookingId} confirmed via Stripe webhook (session: ${stripeSession.id})`);
+                break;
+            }
+            case "payment_intent.succeeded": {
+                const paymentIntent = event.data.object;
+                const bookingId = paymentIntent.metadata?.bookingId;
+                if (!bookingId) {
+                    console.warn("Webhook: No bookingId in payment_intent metadata");
                     res.status(200).json({ received: true });
                     return;
                 }
-                await bookingsCol.updateOne({ _id: objectId }, { $set: { status: "confirmed", updatedAt: new Date() } });
-                const txnId = idempotencyKey;
-                await transactionsCol.insertOne({
-                    userId: booking.guestId,
-                    bookingId,
-                    type: "payment",
-                    amount: booking.totalAmount,
-                    currency: (session.currency || process.env.STRIPE_CURRENCY || "usd").toUpperCase(),
-                    method: "card",
-                    status: "success",
-                    transactionId: txnId,
-                    description: `Payment for booking at ${booking.propertyTitle}`,
-                    createdAt: new Date(),
-                });
-                console.log(`✅ Booking ${bookingId} confirmed via Stripe webhook (session: ${session.id})`);
+                const objectId = toObjectId(parseId(bookingId));
+                if (!objectId) {
+                    console.warn("Webhook: Invalid bookingId:", bookingId);
+                    res.status(200).json({ received: true });
+                    return;
+                }
+                const booking = await bookingsCol.findOne({ _id: objectId });
+                if (!booking) {
+                    console.warn("Webhook: Booking not found:", bookingId);
+                    res.status(200).json({ received: true });
+                    return;
+                }
+                const idempotencyKey = `pi_${paymentIntent.id}`;
+                await confirmBookingAndCreateTransaction(bookingsCol, transactionsCol, client, bookingId, booking, idempotencyKey, paymentIntent.currency || process.env.STRIPE_CURRENCY || "usd");
+                console.log(`✅ Booking ${bookingId} confirmed via PaymentIntent (pi: ${paymentIntent.id})`);
                 break;
             }
             case "checkout.session.expired": {
@@ -137,7 +143,36 @@ async function stripeWebhookHandler(req, res) {
     }
     catch (error) {
         console.error("Webhook handler error:", error);
-        res.status(200).json({ received: true });
+        res.status(500).json({ received: false, message: "Internal server error" });
+    }
+}
+async function confirmBookingAndCreateTransaction(bookingsCol, transactionsCol, client, bookingId, booking, idempotencyKey, currency) {
+    const objectId = toObjectId(parseId(bookingId));
+    if (!objectId)
+        return;
+    const existingTxn = await transactionsCol.findOne({ transactionId: idempotencyKey });
+    if (existingTxn)
+        return;
+    const mongoSession = client.startSession();
+    try {
+        await mongoSession.withTransaction(async () => {
+            await bookingsCol.updateOne({ _id: objectId }, { $set: { status: "confirmed", updatedAt: new Date() } }, { session: mongoSession });
+            await transactionsCol.insertOne({
+                userId: booking.guestId,
+                bookingId,
+                type: "payment",
+                amount: booking.totalAmount,
+                currency: currency.toUpperCase(),
+                method: "card",
+                status: "success",
+                transactionId: idempotencyKey,
+                description: `Payment for booking at ${booking.propertyTitle}`,
+                createdAt: new Date(),
+            }, { session: mongoSession });
+        });
+    }
+    finally {
+        await mongoSession.endSession();
     }
 }
 // ============================================================
@@ -364,9 +399,14 @@ ensureMessageIndexes().catch((err) => console.error("❌ Failed to create messag
 // HELPERS
 // ============================================================
 let JWKS = null;
+let JWKSGeneratedAt = 0;
+const JWKS_TTL_MS = 60 * 60 * 1000; // 1 hour
 function getJWKS() {
-    if (!JWKS)
+    const now = Date.now();
+    if (!JWKS || (now - JWKSGeneratedAt) > JWKS_TTL_MS) {
         JWKS = (0, jose_cjs_1.createRemoteJWKSet)(new URL(`${FRONTEND_URL}/api/auth/jwks`));
+        JWKSGeneratedAt = now;
+    }
     return JWKS;
 }
 function userIdFilter(id) {
@@ -447,6 +487,17 @@ function getPagination(query, maxLimit = 50, defaultLimit = 12) {
     const limit = Math.min(maxLimit, Math.max(1, parseInt(String(query.limit || defaultLimit))));
     const skip = (page - 1) * limit;
     return { page, limit, skip };
+}
+function buildPaginationResponse(total, page, limit) {
+    const totalPages = Math.ceil(total / limit);
+    return {
+        total,
+        totalPages,
+        currentPage: page,
+        limit,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1,
+    };
 }
 // ✅ Fix 3: explicit Cloudinary callback types (no implicit any)
 async function uploadToCloudinary(buffer, folder, filename) {
@@ -561,9 +612,15 @@ const VALID_AMENITIES = [
     "smoke-alarm",
     "first-aid",
     "fire-extinguisher",
+    "hot-water",
+    "refrigerator",
+    "lock",
+    "pet-friendly",
+    "baby-friendly",
+    "wheelchair-accessible",
 ];
 function validatePropertyInput(body) {
-    const { title, description, category, location, price, details, amenities, images, houseRules, status, } = body;
+    const { title, description, category, placeType, location, price, details, amenities, images, houseRules, availabilitySettings, status, } = body;
     if (!title || typeof title !== "string" || title.trim().length < 5)
         return { valid: false, error: "Title must be at least 5 characters." };
     if (title.trim().length > 150)
@@ -706,10 +763,19 @@ function validatePropertyInput(body) {
         title: title.trim(),
         description: description.trim(),
         category: category,
+        ...(placeType !== undefined && {
+            placeType: String(placeType).trim(),
+        }),
         location: {
             address: String(location.address).trim(),
             city: String(location.city).trim(),
+            ...(location.state !== undefined && {
+                state: String(location.state).trim(),
+            }),
             country: String(location.country).trim(),
+            ...(location.zipCode !== undefined && {
+                zipCode: String(location.zipCode).trim(),
+            }),
             ...(location.coordinates && {
                 coordinates: {
                     lat: Number(location.coordinates.lat),
@@ -719,6 +785,9 @@ function validatePropertyInput(body) {
         },
         price: {
             perNight,
+            ...(price.currency !== undefined && {
+                currency: String(price.currency).trim(),
+            }),
             ...(price.weeklyDiscount !== undefined && {
                 weeklyDiscount: Number(price.weeklyDiscount),
             }),
@@ -765,6 +834,15 @@ function validatePropertyInput(body) {
                 checkInTime: "14:00",
                 checkOutTime: "11:00",
             },
+        ...(availabilitySettings !== undefined && {
+            availabilitySettings: {
+                minStay: Number(availabilitySettings.minStay) || 1,
+                maxStay: Number(availabilitySettings.maxStay) || 30,
+                advanceNotice: Number(availabilitySettings.advanceNotice) || 1,
+                availableFrom: String(availabilitySettings.availableFrom || ""),
+                availableTo: String(availabilitySettings.availableTo || ""),
+            },
+        }),
     };
     return { valid: true, data };
 }
@@ -776,6 +854,7 @@ function buildPropertyResponse(p) {
         title: p.title,
         description: p.description,
         category: p.category,
+        placeType: p.placeType || null,
         location: p.location,
         price: p.price,
         details: p.details,
@@ -783,6 +862,7 @@ function buildPropertyResponse(p) {
         images: p.images || [],
         houseRules: p.houseRules,
         availability: p.availability || [],
+        availabilitySettings: p.availabilitySettings || null,
         status: p.status,
         rating: p.rating ?? 0,
         reviewCount: p.reviewCount ?? 0,
@@ -850,6 +930,30 @@ const verifyToken = async (req, res, next) => {
         if (error?.code === "ERR_JWS_INVALID" ||
             error?.code === "ERR_JWT_INVALID") {
             res.status(401).json({ success: false, message: "Invalid token." });
+            return;
+        }
+        if (error?.code === "ERR_JWKS_NO_MATCHING_KEY") {
+            res.status(401).json({
+                success: false,
+                message: "Authentication service unavailable (key mismatch).",
+            });
+            return;
+        }
+        if (error?.code === "ERR_JWKS_MULTIPLE_MATCHING_KEYS") {
+            res.status(401).json({
+                success: false,
+                message: "Authentication service error (multiple keys).",
+            });
+            return;
+        }
+        if (error?.message?.includes("fetch") ||
+            error?.message?.includes("ECONNREFUSED") ||
+            error?.message?.includes("ENOTFOUND")) {
+            console.error("[verifyToken] JWKS fetch failed:", error.message);
+            res.status(503).json({
+                success: false,
+                message: "Authentication service unreachable. Try again later.",
+            });
             return;
         }
         console.error("[verifyToken] error:", error);
@@ -2924,6 +3028,7 @@ app.post("/api/bookings", verifyToken, async (req, res) => {
             return;
         }
         const db = await getDb();
+        const client = await getClientPromise();
         const propertiesCol = db.collection("properties");
         const bookingsCol = db.collection("bookings");
         const propertyOid = toObjectId(parseId(propertyId));
@@ -2943,14 +3048,6 @@ app.post("/api/bookings", verifyToken, async (req, res) => {
             res.status(400).json({
                 success: false,
                 message: `Maximum ${property.details.maxGuests} guests allowed.`,
-            });
-            return;
-        }
-        const hasOverlap = await checkDateOverlap(bookingsCol, propertyId, checkInDate, checkOutDate);
-        if (hasOverlap) {
-            res.status(409).json({
-                success: false,
-                message: "This property is already booked for the selected dates.",
             });
             return;
         }
@@ -2980,7 +3077,21 @@ app.post("/api/bookings", verifyToken, async (req, res) => {
             createdAt: now,
             updatedAt: now,
         };
-        const result = await bookingsCol.insertOne(booking);
+        // Atomic transaction — prevents double-booking race condition
+        const session = client.startSession();
+        let result;
+        try {
+            await session.withTransaction(async () => {
+                const hasOverlap = await checkDateOverlap(bookingsCol, propertyId, checkInDate, checkOutDate);
+                if (hasOverlap) {
+                    throw new Error("OVERLAP_CONFLICT");
+                }
+                result = await bookingsCol.insertOne(booking, { session });
+            });
+        }
+        finally {
+            await session.endSession();
+        }
         res.status(201).json({
             success: true,
             message: "Booking created. Proceed to payment.",
@@ -2990,6 +3101,13 @@ app.post("/api/bookings", verifyToken, async (req, res) => {
         });
     }
     catch (error) {
+        if (error?.message === "OVERLAP_CONFLICT") {
+            res.status(409).json({
+                success: false,
+                message: "This property is already booked for the selected dates.",
+            });
+            return;
+        }
         console.error("Create booking error:", error);
         res.status(500).json({ success: false, message: "Failed to create booking." });
     }
@@ -3328,15 +3446,16 @@ app.put("/api/admin/bookings/:id/force-cancel", verifyToken, verifyAdmin, async 
     }
 });
 // ============================================================
-// STRIPE PAYMENT ROUTES
+// PAYMENT INTENT ROUTE (embedded Elements flow)
 // ============================================================
-// POST create checkout session (standalone)
-app.post("/api/payments/create-checkout-session", verifyToken, async (req, res) => {
+// POST create PaymentIntent for embedded card payment
+app.post("/api/payments/create-payment-intent", verifyToken, async (req, res) => {
     if (!stripe) {
         res.status(503).json({ success: false, message: "Stripe not configured." });
         return;
     }
     try {
+        const user = req.user;
         const { bookingId } = req.body;
         if (!bookingId) {
             res.status(400).json({ success: false, message: "bookingId is required." });
@@ -3354,7 +3473,7 @@ app.post("/api/payments/create-checkout-session", verifyToken, async (req, res) 
             res.status(404).json({ success: false, message: "Booking not found." });
             return;
         }
-        const userId = toIdString(req.user._id);
+        const userId = toIdString(user._id);
         if (booking.guestId !== userId) {
             res.status(403).json({ success: false, message: "This booking does not belong to you." });
             return;
@@ -3363,80 +3482,31 @@ app.post("/api/payments/create-checkout-session", verifyToken, async (req, res) 
             res.status(400).json({ success: false, message: "Only pending bookings can be paid." });
             return;
         }
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ["card"],
-            mode: "payment",
-            line_items: [
-                {
-                    price_data: {
-                        currency: process.env.STRIPE_CURRENCY || "usd",
-                        product_data: {
-                            name: booking.propertyTitle || "Property Booking",
-                            images: booking.propertyImage ? [booking.propertyImage] : [],
-                        },
-                        unit_amount: Math.round(booking.totalAmount * 100),
-                    },
-                    quantity: 1,
-                },
-            ],
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount: Math.round(booking.totalAmount * 100),
+            currency: (process.env.STRIPE_CURRENCY || "usd").toLowerCase(),
             metadata: {
-                bookingId: bookingId,
-                guestId: booking.guestId,
+                bookingId,
+                guestId: userId,
             },
-            success_url: `${FRONTEND_URL}/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${FRONTEND_URL}/checkout/cancel`,
+            description: `Booking at ${booking.propertyTitle || "StayEase property"}`,
         });
-        res.status(200).json({
-            success: true,
-            data: { url: session.url, sessionId: session.id },
-        });
-    }
-    catch (error) {
-        console.error("Create checkout session error:", error);
-        res.status(500).json({ success: false, message: "Failed to create checkout session." });
-    }
-});
-// POST verify session
-app.post("/api/payments/verify-session", verifyToken, async (req, res) => {
-    if (!stripe) {
-        res.status(503).json({ success: false, message: "Stripe not configured." });
-        return;
-    }
-    try {
-        const { sessionId } = req.body;
-        if (!sessionId) {
-            res.status(400).json({ success: false, message: "sessionId is required." });
-            return;
-        }
-        const session = await stripe.checkout.sessions.retrieve(sessionId);
-        if (session.payment_status !== "paid") {
-            res.status(400).json({ success: false, message: "Payment not completed.", data: { status: session.payment_status } });
-            return;
-        }
-        const bookingId = session.metadata?.bookingId;
-        if (!bookingId) {
-            res.status(400).json({ success: false, message: "No booking associated with this session." });
-            return;
-        }
-        const db = await getDb();
-        const bookingsCol = db.collection("bookings");
-        const objectId = toObjectId(parseId(bookingId));
-        const booking = objectId ? await bookingsCol.findOne({ _id: objectId }) : null;
         res.status(200).json({
             success: true,
             data: {
-                booking,
-                paymentStatus: session.payment_status,
-                amountTotal: session.amount_total ? session.amount_total / 100 : 0,
-                currency: session.currency,
+                clientSecret: paymentIntent.client_secret,
+                paymentIntentId: paymentIntent.id,
             },
         });
     }
     catch (error) {
-        console.error("Verify session error:", error);
-        res.status(500).json({ success: false, message: "Failed to verify session." });
+        console.error("Create PaymentIntent error:", error);
+        res.status(500).json({ success: false, message: "Failed to create payment intent." });
     }
 });
+// ============================================================
+// PAYOUT ROUTES (host bank details, manual payouts)
+// ============================================================
 // PUT save payout method (host bank details)
 app.put("/api/payments/payout-method", verifyToken, verifyHostOrAdmin, async (req, res) => {
     try {
@@ -3486,10 +3556,18 @@ app.get("/api/payments/payout-method", verifyToken, verifyHostOrAdmin, async (re
             res.status(200).json({ success: true, data: null });
             return;
         }
-        // Mask account number
+        // Mask sensitive fields
         const accNum = method.accountNumber || "";
-        const masked = accNum.length > 4
+        const maskedAccount = accNum.length > 4
             ? "****" + accNum.slice(-4)
+            : "****";
+        const rtNum = method.routingNumber || "";
+        const maskedRouting = rtNum.length > 4
+            ? "****" + rtNum.slice(-4)
+            : "****";
+        const swCode = method.swiftCode || "";
+        const maskedSwift = swCode.length > 4
+            ? "****" + swCode.slice(-4)
             : "****";
         res.status(200).json({
             success: true,
@@ -3497,9 +3575,9 @@ app.get("/api/payments/payout-method", verifyToken, verifyHostOrAdmin, async (re
                 id: toIdString(method._id),
                 accountHolder: method.accountHolder,
                 bankName: method.bankName,
-                accountNumber: masked,
-                routingNumber: method.routingNumber,
-                swiftCode: method.swiftCode,
+                accountNumber: maskedAccount,
+                routingNumber: maskedRouting,
+                swiftCode: maskedSwift,
                 bankAddress: method.bankAddress,
                 createdAt: method.createdAt,
                 updatedAt: method.updatedAt,
@@ -3674,7 +3752,58 @@ app.get("/api/transactions/host-transactions", verifyToken, verifyHostOrAdmin, a
         res.status(500).json({ success: false, message: "Failed to fetch host transactions." });
     }
 });
-// GET single transaction
+// GET transaction stats (MUST be before /:id — Express matches in order)
+app.get("/api/transactions/stats", verifyToken, async (req, res) => {
+    try {
+        const db = await getDb();
+        const col = db.collection("transactions");
+        const userId = toIdString(req.user._id);
+        const isAdmin = req.user.role === "admin";
+        let matchFilter = {};
+        if (!isAdmin) {
+            matchFilter = { userId };
+        }
+        const totalSpendArr = await col.aggregate([
+            { $match: { ...matchFilter, type: "payment", status: "success" } },
+            { $group: { _id: null, total: { $sum: "$amount" } } },
+        ]).toArray();
+        const totalSpend = totalSpendArr[0]?.total || 0;
+        const totalEarnArr = await col.aggregate([
+            { $match: { ...matchFilter, type: "payout", status: "success" } },
+            { $group: { _id: null, total: { $sum: "$amount" } } },
+        ]).toArray();
+        const totalEarned = totalEarnArr[0]?.total || 0;
+        let commissionEarned = 0;
+        let pendingPayouts = 0;
+        if (isAdmin) {
+            const commissionArr = await col.aggregate([
+                { $match: { type: "commission", status: "success" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray();
+            commissionEarned = commissionArr[0]?.total || 0;
+            const pendingArr = await col.aggregate([
+                { $match: { type: "payout", status: "pending" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray();
+            pendingPayouts = pendingArr[0]?.total || 0;
+        }
+        res.status(200).json({
+            success: true,
+            data: {
+                totalSpend: Math.round(totalSpend * 100) / 100,
+                totalEarned: Math.round(totalEarned * 100) / 100,
+                ...(isAdmin ? {
+                    commissionEarned: Math.round(commissionEarned * 100) / 100,
+                    pendingPayouts: Math.round(pendingPayouts * 100) / 100,
+                } : {}),
+            },
+        });
+    }
+    catch {
+        res.status(500).json({ success: false, message: "Failed to fetch transaction stats." });
+    }
+});
+// GET single transaction (must be after specific routes)
 app.get("/api/transactions/:id", verifyToken, async (req, res) => {
     try {
         const id = parseId(req.params.id);
@@ -3788,60 +3917,6 @@ app.get("/api/admin/transactions", verifyToken, verifyAdmin, async (req, res) =>
     }
     catch {
         res.status(500).json({ success: false, message: "Failed to fetch transactions." });
-    }
-});
-// GET transaction stats
-app.get("/api/transactions/stats", verifyToken, async (req, res) => {
-    try {
-        const db = await getDb();
-        const col = db.collection("transactions");
-        const userId = toIdString(req.user._id);
-        const isAdmin = req.user.role === "admin";
-        let matchFilter = {};
-        if (!isAdmin) {
-            matchFilter = { userId };
-        }
-        // Total spend (guest payments)
-        const totalSpendArr = await col.aggregate([
-            { $match: { ...matchFilter, type: "payment", status: "success" } },
-            { $group: { _id: null, total: { $sum: "$amount" } } },
-        ]).toArray();
-        const totalSpend = totalSpendArr[0]?.total || 0;
-        // Total earned (host earnings)
-        const totalEarnArr = await col.aggregate([
-            { $match: { ...matchFilter, type: "payout", status: "success" } },
-            { $group: { _id: null, total: { $sum: "$amount" } } },
-        ]).toArray();
-        const totalEarned = totalEarnArr[0]?.total || 0;
-        // Platform commission earned (admin only)
-        let commissionEarned = 0;
-        let pendingPayouts = 0;
-        if (isAdmin) {
-            const commissionArr = await col.aggregate([
-                { $match: { type: "commission", status: "success" } },
-                { $group: { _id: null, total: { $sum: "$amount" } } },
-            ]).toArray();
-            commissionEarned = commissionArr[0]?.total || 0;
-            const pendingArr = await col.aggregate([
-                { $match: { type: "payout", status: "pending" } },
-                { $group: { _id: null, total: { $sum: "$amount" } } },
-            ]).toArray();
-            pendingPayouts = pendingArr[0]?.total || 0;
-        }
-        res.status(200).json({
-            success: true,
-            data: {
-                totalSpend: Math.round(totalSpend * 100) / 100,
-                totalEarned: Math.round(totalEarned * 100) / 100,
-                ...(isAdmin ? {
-                    commissionEarned: Math.round(commissionEarned * 100) / 100,
-                    pendingPayouts: Math.round(pendingPayouts * 100) / 100,
-                } : {}),
-            },
-        });
-    }
-    catch {
-        res.status(500).json({ success: false, message: "Failed to fetch transaction stats." });
     }
 });
 // POST admin process payout
@@ -4156,15 +4231,18 @@ app.get("/api/reviews/property/:id", async (req, res) => {
             reviewsCol.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
             reviewsCol.countDocuments(filter),
         ]);
-        const reviewsWithGuests = await Promise.all(reviews.map(async (r) => {
-            const guest = await findUserById(usersCol, r.guestId);
+        // Batch user lookup — replaces N+1
+        const guestIds = reviews.map((r) => r.guestId).filter(Boolean);
+        const usersMap = guestIds.length > 0 ? await findUsersMap(usersCol, guestIds) : new Map();
+        const reviewsWithGuests = reviews.map((r) => {
+            const guest = usersMap.get(r.guestId);
             return {
                 ...r,
                 guest: guest
                     ? { id: toIdString(guest._id), name: guest.name, image: guest.image }
                     : null,
             };
-        }));
+        });
         res.status(200).json({
             success: true,
             data: {
