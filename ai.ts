@@ -38,6 +38,17 @@ interface AuthReq extends Request {
     };
 }
 
+function handleGroqError(error: any, res: Response): boolean {
+    if (error?.status === 429 || error?.message?.includes("rate limit")) {
+        res.status(429).json({
+            success: false,
+            message: "AI service is experiencing high demand. Please try again in a few minutes.",
+        });
+        return true;
+    }
+    return false;
+}
+
 export function registerAiRoutes(
     app: any,
     deps: {
@@ -159,15 +170,21 @@ ${JSON.stringify(propertyList, null, 2)}
 Respond with ONLY a valid JSON array (no markdown, no code blocks):
 [{"propertyId":"...","title":"...","reason":"..."}]`;
 
-                const completion = await groq.chat.completions.create({
-                    messages: [
-                        { role: "system", content: systemPrompt },
-                        { role: "user", content: "Recommend the best properties based on my preferences and history." },
-                    ],
-                    model: AI_MODEL,
-                    temperature: 0.4,
-                    max_tokens: 2048,
-                });
+                let completion;
+                try {
+                    completion = await groq.chat.completions.create({
+                        messages: [
+                            { role: "system", content: systemPrompt },
+                            { role: "user", content: "Recommend the best properties based on my preferences and history." },
+                        ],
+                        model: AI_MODEL,
+                        temperature: 0.4,
+                        max_tokens: 2048,
+                    });
+                } catch (groqError: any) {
+                    if (handleGroqError(groqError, res)) return;
+                    throw groqError;
+                }
 
                 const raw = completion.choices[0]?.message?.content || "[]";
                 let recommendations: any[];
@@ -214,11 +231,10 @@ Respond with ONLY a valid JSON array (no markdown, no code blocks):
     );
 
     // ============================================================
-    // POST /api/ai/chat
+    // POST /api/ai/chat — works with or without auth; saves history only when logged in
     // ============================================================
     app.post(
         "/api/ai/chat",
-        verifyToken,
         async (req: AuthReq, res: Response): Promise<void> => {
             try {
                 const groq = getGroq();
@@ -227,9 +243,32 @@ Respond with ONLY a valid JSON array (no markdown, no code blocks):
                     return;
                 }
 
-                const userId = req.user!._id.toString();
-                const userName = req.user!.name;
-                const userRole = req.user!.role;
+                let userId: string | null = null;
+                let userName = "Guest";
+                let userRole = "guest";
+                const authHeader = req.headers.authorization;
+                if (authHeader?.startsWith("Bearer ")) {
+                    try {
+                        const token = authHeader.substring(7).trim();
+                        if (token) {
+                            const { jwtVerify } = await import("jose-cjs");
+                            const { payload } = await jwtVerify(token, getGroq() as any);
+                            const jwtPayload = payload as any;
+                            if (jwtPayload.sub) {
+                                const db = await getDb();
+                                const user = await db.collection("user").findOne({ _id: new ObjectId(jwtPayload.sub) });
+                                if (user && !user.banned) {
+                                    userId = user._id.toString();
+                                    userName = user.name;
+                                    userRole = user.role;
+                                }
+                            }
+                        }
+                    } catch {
+                        // Token invalid/expired — continue as guest
+                    }
+                }
+
                 const { message, conversationId } = req.body;
 
                 if (!message || typeof message !== "string") {
@@ -237,30 +276,26 @@ Respond with ONLY a valid JSON array (no markdown, no code blocks):
                     return;
                 }
 
-                const db = await getDb();
-                const aiConvoCol = db.collection("ai_conversations");
-                const bookingsCol = db.collection("bookings");
+                let conversationHistory: Array<{ role: "user" | "assistant"; content: string }> = [];
+                let conversationIdOut: string | null = null;
 
-                let conversation: AIConversationDoc | null = null;
+                if (userId) {
+                    const db = await getDb();
+                    const aiConvoCol = db.collection("ai_conversations");
 
-                if (conversationId) {
-                    const oid = new ObjectId(conversationId);
-                    conversation = await aiConvoCol.findOne({ _id: oid, userId }) as AIConversationDoc | null;
+                    let conversation: AIConversationDoc | null = null;
+                    if (conversationId) {
+                        const oid = new ObjectId(conversationId);
+                        conversation = await aiConvoCol.findOne({ _id: oid, userId }) as AIConversationDoc | null;
+                    }
+                    if (!conversation) {
+                        conversation = { userId, messages: [], createdAt: new Date(), updatedAt: new Date() };
+                        const result = await aiConvoCol.insertOne(conversation);
+                        conversation._id = result.insertedId;
+                    }
+                    conversationHistory = conversation.messages;
+                    conversationIdOut = conversation._id!.toString();
                 }
-
-                if (!conversation) {
-                    conversation = {
-                        userId,
-                        messages: [],
-                        createdAt: new Date(),
-                        updatedAt: new Date(),
-                    };
-                    const result = await aiConvoCol.insertOne(conversation);
-                    conversation._id = result.insertedId;
-                }
-
-                // Fetch user context
-                const bookingCount = await bookingsCol.countDocuments({ guestId: userId });
 
                 const systemPrompt = `You are a helpful AI assistant for StayEase (AuraSpace), a property rental platform. 
 You help users find properties, with booking guidance, and platform navigation.
@@ -274,61 +309,59 @@ RULES:
 
 USER CONTEXT:
 - Name: ${userName}
-- Role: ${userRole}
-- Active Bookings: ${bookingCount}`;
+- Role: ${userRole}${userId ? `\n- Authenticated: Yes` : `\n- Authenticated: No (guest mode — no history saved)`}`;
 
                 const messages = [
                     { role: "system", content: systemPrompt } as const,
-                    ...conversation.messages.slice(-20).map((m) => ({
+                    ...conversationHistory.slice(-20).map((m) => ({
                         role: m.role as "user" | "assistant",
                         content: m.content,
                     })),
                     { role: "user" as const, content: message },
                 ];
 
-                const completion = await groq.chat.completions.create({
-                    messages,
-                    model: AI_MODEL,
-                    temperature: 0.6,
-                    max_tokens: 1024,
-                });
+                let completion;
+                try {
+                    completion = await groq.chat.completions.create({
+                        messages, model: AI_MODEL, temperature: 0.6, max_tokens: 1024,
+                    });
+                } catch (groqError: any) {
+                    if (handleGroqError(groqError, res)) return;
+                    throw groqError;
+                }
 
                 const reply = completion.choices[0]?.message?.content || "I'm sorry, I couldn't generate a response.";
 
-                // Save messages
-                const now = new Date();
-                await aiConvoCol.updateOne(
-                    { _id: conversation._id },
-                    {
-                        $push: {
-                            messages: {
-                                $each: [
-                                    { role: "user", content: message, createdAt: now },
-                                    { role: "assistant", content: reply, createdAt: now },
-                                ],
+                if (userId && conversationIdOut) {
+                    const db = await getDb();
+                    const aiConvoCol = db.collection("ai_conversations");
+                    const now = new Date();
+                    await aiConvoCol.updateOne(
+                        { _id: new ObjectId(conversationIdOut) },
+                        {
+                            $push: {
+                                messages: {
+                                    $each: [
+                                        { role: "user", content: message, createdAt: now },
+                                        { role: "assistant", content: reply, createdAt: now },
+                                    ],
+                                },
                             },
+                            $set: { updatedAt: now },
                         },
-                        $set: { updatedAt: now },
-                    },
-                );
+                    );
+                }
 
-                // Generate suggestions
                 const suggestions = generateSuggestions(message, reply);
 
                 res.status(200).json({
                     success: true,
-                    data: {
-                        reply,
-                        conversationId: conversation._id!.toString(),
-                        suggestions,
-                    },
+                    data: { reply, conversationId: conversationIdOut, suggestions },
                 });
             } catch (error: any) {
                 console.error("[AI Chat] Error:", error);
-                res.status(500).json({
-                    success: false,
-                    message: error.message || "Failed to process chat message.",
-                });
+                if (handleGroqError(error, res)) return;
+                res.status(500).json({ success: false, message: error.message || "Failed to process chat message." });
             }
         },
     );
@@ -405,13 +438,19 @@ USER CONTEXT:
                 res.setHeader("Connection", "keep-alive");
                 res.setHeader("X-Accel-Buffering", "no");
 
-                const stream = await groq.chat.completions.create({
-                    messages,
-                    model: AI_MODEL,
-                    temperature: 0.6,
-                    max_tokens: 1024,
-                    stream: true,
-                });
+                let stream;
+                try {
+                    stream = await groq.chat.completions.create({
+                        messages,
+                        model: AI_MODEL,
+                        temperature: 0.6,
+                        max_tokens: 1024,
+                        stream: true,
+                    });
+                } catch (groqError: any) {
+                    if (handleGroqError(groqError, res)) return;
+                    throw groqError;
+                }
 
                 let fullReply = "";
 
@@ -446,6 +485,7 @@ USER CONTEXT:
             } catch (error: any) {
                 console.error("[AI Chat Stream] Error:", error);
                 if (!res.headersSent) {
+                    if (handleGroqError(error, res)) return;
                     res.status(500).json({ success: false, message: error.message || "Stream failed." });
                 } else {
                     res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
@@ -607,15 +647,21 @@ LENGTH: ${lengthGuide[length as string] || lengthGuide.medium}
 
 Write only the description, no title or prefix.`;
 
-                const completion = await groq.chat.completions.create({
-                    messages: [
-                        { role: "system", content: "You are a professional copywriter specializing in property listings. Write engaging, accurate descriptions that highlight key features." },
-                        { role: "user", content: prompt },
-                    ],
-                    model: AI_MODEL,
-                    temperature: 0.7,
-                    max_tokens: 1024,
-                });
+                let completion;
+                try {
+                    completion = await groq.chat.completions.create({
+                        messages: [
+                            { role: "system", content: "You are a professional copywriter specializing in property listings. Write engaging, accurate descriptions that highlight key features." },
+                            { role: "user", content: prompt },
+                        ],
+                        model: AI_MODEL,
+                        temperature: 0.7,
+                        max_tokens: 1024,
+                    });
+                } catch (groqError: any) {
+                    if (handleGroqError(groqError, res)) return;
+                    throw groqError;
+                }
 
                 const description = completion.choices[0]?.message?.content?.trim() || "";
 

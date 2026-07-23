@@ -1040,6 +1040,7 @@ function getGroq(): Groq {
 }
 
 const AI_MODEL = "llama-3.3-70b-versatile";
+const AI_MODEL_FALLBACKS = ["llama-3.1-8b-instant", "gemma2-9b-it", "llama-3.1-8b-versatile"];
 
 interface AIConversationDoc {
     _id?: ObjectId;
@@ -7154,13 +7155,27 @@ ${JSON.stringify(propertyList, null, 2)}
 Respond with ONLY a valid JSON array (no markdown):
 [{"propertyId":"...","title":"...","reason":"..."}]`;
 
-            const completion = await groq.chat.completions.create({
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: "Recommend the best properties based on my preferences and history." },
-                ],
-                model: AI_MODEL, temperature: 0.4, max_tokens: 2048,
-            });
+            const recModels = [AI_MODEL, ...AI_MODEL_FALLBACKS];
+            let completion: any = null;
+            for (const model of recModels) {
+                try {
+                    completion = await groq.chat.completions.create({
+                        messages: [
+                            { role: "system", content: systemPrompt },
+                            { role: "user", content: "Recommend the best properties based on my preferences and history." },
+                        ],
+                        model, temperature: 0.4,
+                    });
+                    break;
+                } catch (e: any) {
+                    if (e?.status === 429 || e?.message?.includes("rate limit")) continue;
+                    throw e;
+                }
+            }
+            if (!completion) {
+                res.status(429).json({ success: false, message: "AI service is experiencing high demand. Please try again in a few minutes." });
+                return;
+            }
 
             const raw = completion.choices[0]?.message?.content || "[]";
             let recommendations: any[];
@@ -7190,10 +7205,9 @@ Respond with ONLY a valid JSON array (no markdown):
     },
 );
 
-// POST /api/ai/chat
+// POST /api/ai/chat — works with or without auth; saves history only when logged in
 app.post(
     "/api/ai/chat",
-    verifyToken,
     async (req: AIAuthReq, res: Response): Promise<void> => {
         try {
             const groq = getGroq();
@@ -7202,9 +7216,32 @@ app.post(
                 return;
             }
 
-            const userId = req.user!._id.toString();
-            const userName = req.user!.name;
-            const userRole = req.user!.role;
+            // Optional auth: try to identify user but don't block
+            let userId: string | null = null;
+            let userName = "Guest";
+            let userRole = "guest";
+            const authHeader = req.headers.authorization;
+            if (authHeader?.startsWith("Bearer ")) {
+                try {
+                    const token = authHeader.substring(7).trim();
+                    if (token) {
+                        const { payload } = await jwtVerify(token, getJWKS());
+                        const jwtPayload = payload as JwtPayload;
+                        if (jwtPayload.sub) {
+                            const db = await getDb();
+                            const user = await findUserById(db.collection("user"), jwtPayload.sub);
+                            if (user && !user.banned) {
+                                userId = user._id.toString();
+                                userName = user.name;
+                                userRole = user.role;
+                            }
+                        }
+                    }
+                } catch {
+                    // Token invalid/expired — continue as guest
+                }
+            }
+
             const { message, conversationId } = req.body;
 
             if (!message || typeof message !== "string") {
@@ -7212,79 +7249,109 @@ app.post(
                 return;
             }
 
-            const db = await getDb();
-            const aiConvoCol = db.collection("ai_conversations");
-            const bookingsCol = db.collection("bookings");
+            let conversationHistory: Array<{ role: "user" | "assistant"; content: string }> = [];
+            let conversationIdOut: string | null = null;
 
-            let conversation: AIConversationDoc | null = null;
+            // Load conversation history only if user is logged in
+            if (userId) {
+                const db = await getDb();
+                const aiConvoCol = db.collection("ai_conversations");
 
-            if (conversationId) {
-                const oid = new ObjectId(conversationId);
-                conversation = await aiConvoCol.findOne({ _id: oid, userId }) as AIConversationDoc | null;
+                let conversation: AIConversationDoc | null = null;
+                if (conversationId) {
+                    const oid = new ObjectId(conversationId);
+                    conversation = await aiConvoCol.findOne({ _id: oid, userId }) as AIConversationDoc | null;
+                }
+                if (!conversation) {
+                    conversation = { userId, messages: [], createdAt: new Date(), updatedAt: new Date() };
+                    const result = await aiConvoCol.insertOne(conversation);
+                    conversation._id = result.insertedId;
+                }
+                conversationHistory = conversation.messages;
+                conversationIdOut = conversation._id!.toString();
             }
 
-            if (!conversation) {
-                conversation = { userId, messages: [], createdAt: new Date(), updatedAt: new Date() };
-                const result = await aiConvoCol.insertOne(conversation);
-                conversation._id = result.insertedId;
-            }
-
-            const bookingCount = await bookingsCol.countDocuments({ guestId: userId });
-
-            const systemPrompt = `You are a helpful AI assistant for AuraSpace, a property rental platform.
-You help users find properties, with booking guidance, and platform navigation.
-
-RULES:
-- Keep responses concise (2-4 sentences).
-- If the user asks about finding properties, ask about their location, budget, guests, and preferences.
-- For navigation questions, give clear step-by-step instructions.
-- Be friendly, professional, and helpful.
-- If you don't know something, say so honestly.
-
-USER CONTEXT:
-- Name: ${userName}
-- Role: ${userRole}
-- Active Bookings: ${bookingCount}`;
+            const systemPrompt = `You are AuraSpace AI, a helpful assistant for a property rental platform. Be concise (1-3 sentences), friendly, and helpful. For property searches, ask about location, budget, and guests. For navigation, give brief step-by-step instructions.`;
 
             const messages = [
                 { role: "system", content: systemPrompt } as const,
-                ...conversation.messages.slice(-20).map((m) => ({
+                ...conversationHistory.slice(-10).map((m) => ({
                     role: m.role as "user" | "assistant",
                     content: m.content,
                 })),
                 { role: "user" as const, content: message },
             ];
 
-            const completion = await groq.chat.completions.create({
-                messages, model: AI_MODEL, temperature: 0.6, max_tokens: 1024,
-            });
+            const models = [AI_MODEL, ...AI_MODEL_FALLBACKS];
+            let completion: any = null;
+            let lastError: any = null;
+
+            for (const model of models) {
+                try {
+                    completion = await groq.chat.completions.create({
+                        messages, model, temperature: 0.6,
+                    });
+                    break;
+                } catch (groqError: any) {
+                    lastError = groqError;
+                    if (groqError?.status === 429 || groqError?.message?.includes("rate limit")) {
+                        console.warn(`[AI Chat] Model ${model} rate limited, trying next...`);
+                        continue;
+                    }
+                    throw groqError;
+                }
+            }
+
+            if (!completion) {
+                res.status(429).json({
+                    success: false,
+                    message: "AI service is experiencing high demand. Please try again in a few minutes.",
+                });
+                return;
+            }
 
             const reply = completion.choices[0]?.message?.content || "I'm sorry, I couldn't generate a response.";
 
-            const now = new Date();
-            await aiConvoCol.updateOne(
-                { _id: conversation._id },
-                {
-                    $push: {
-                        messages: {
-                            $each: [
-                                { role: "user" as const, content: message, createdAt: now },
-                                { role: "assistant" as const, content: reply, createdAt: now },
-                            ],
-                        },
+            // Save to DB only if user is logged in
+            if (userId && conversationIdOut) {
+                const db = await getDb();
+                const aiConvoCol = db.collection("ai_conversations");
+                const now = new Date();
+                await aiConvoCol.updateOne(
+                    { _id: new ObjectId(conversationIdOut) },
+                    {
+                        $push: {
+                            messages: {
+                                $each: [
+                                    { role: "user" as const, content: message, createdAt: now },
+                                    { role: "assistant" as const, content: reply, createdAt: now },
+                                ],
+                            },
+                        } as any,
+                        $set: { updatedAt: now },
                     } as any,
-                    $set: { updatedAt: now },
-                } as any,
-            );
+                );
+            }
 
             const suggestions = generateSuggestions(message, reply);
 
             res.status(200).json({
                 success: true,
-                data: { reply, conversationId: conversation._id!.toString(), suggestions },
+                data: {
+                    reply,
+                    conversationId: conversationIdOut,
+                    suggestions,
+                },
             });
         } catch (error: any) {
             console.error("[AI Chat] Error:", error);
+            if (error?.status === 429 || error?.message?.includes("rate limit")) {
+                res.status(429).json({
+                    success: false,
+                    message: "AI service is experiencing high demand. Please try again in a few minutes.",
+                });
+                return;
+            }
             res.status(500).json({ success: false, message: error.message || "Failed to process chat message." });
         }
     },
@@ -7526,13 +7593,27 @@ LENGTH: ${lengthGuide[length as string] || lengthGuide.medium}
 
 Write only the description, no title or prefix.`;
 
-            const completion = await groq.chat.completions.create({
-                messages: [
-                    { role: "system", content: "You are a professional copywriter specializing in property listings. Write engaging, accurate descriptions that highlight key features." },
-                    { role: "user", content: prompt },
-                ],
-                model: AI_MODEL, temperature: 0.7, max_tokens: 1024,
-            });
+            const descModels = [AI_MODEL, ...AI_MODEL_FALLBACKS];
+            let completion: any = null;
+            for (const model of descModels) {
+                try {
+                    completion = await groq.chat.completions.create({
+                        messages: [
+                            { role: "system", content: "You are a professional copywriter specializing in property listings. Write engaging, accurate descriptions that highlight key features." },
+                            { role: "user", content: prompt },
+                        ],
+                        model, temperature: 0.7,
+                    });
+                    break;
+                } catch (e: any) {
+                    if (e?.status === 429 || e?.message?.includes("rate limit")) continue;
+                    throw e;
+                }
+            }
+            if (!completion) {
+                res.status(429).json({ success: false, message: "AI service is experiencing high demand. Please try again in a few minutes." });
+                return;
+            }
 
             const description = completion.choices[0]?.message?.content?.trim() || "";
 
