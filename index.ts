@@ -76,7 +76,7 @@ app.use("/uploads", express.static(UPLOAD_DIR));
 
 const uri: string = process.env.MONGODB_URI || "";
 const dbName: string = process.env.DB_NAME || "StayEase";
-const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
+const CLIENT_URL = process.env.CLIENT_URL || process.env.FRONTEND_URL || "http://localhost:3000";
 
 // ============================================================
 // STRIPE CONFIG
