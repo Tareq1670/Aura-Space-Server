@@ -16,6 +16,7 @@ import fs from "fs";
 import path from "path";
 import Stripe from "stripe";
 import Groq from "groq-sdk";
+import { registerAiRoutes } from "./ai";
 
 dotenv.config();
 
@@ -55,7 +56,7 @@ app.use(
             }
         },
         credentials: true,
-        methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allowedHeaders: ["Content-Type", "Authorization"],
     }),
 );
@@ -8321,6 +8322,11 @@ app.post(
         }
     },
 );
+
+// ============================================================
+// AI ROUTES
+// ============================================================
+registerAiRoutes(app, { getDb, verifyToken });
 
 // ============================================================
 // GLOBAL ERROR HANDLER

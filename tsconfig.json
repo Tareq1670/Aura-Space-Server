@@ -14,6 +14,6 @@
         "sourceMap": true,
         "moduleResolution": "node"
     },
-    "include": ["index.ts"],
+    "include": ["index.ts", "ai.ts"],
     "exclude": ["node_modules", "dist"]
 }

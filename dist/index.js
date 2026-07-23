@@ -11,10 +11,11 @@ const mongodb_1 = require("mongodb");
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const jose_cjs_1 = require("jose-cjs");
 const multer_1 = __importDefault(require("multer"));
-const cloudinary_1 = require("cloudinary");
-const stream_1 = require("stream");
+const fs_1 = __importDefault(require("fs"));
+const path_1 = __importDefault(require("path"));
 const stripe_1 = __importDefault(require("stripe"));
 const groq_sdk_1 = __importDefault(require("groq-sdk"));
+const ai_1 = require("./ai");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const allowedOrigins = [
@@ -47,24 +48,22 @@ app.use((0, cors_1.default)({
         }
     },
     credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
 }));
 // Stripe webhook MUST use raw body — register BEFORE express.json()
 app.post("/api/webhooks/stripe", express_1.default.raw({ type: "application/json" }), stripeWebhookHandler);
 app.use(express_1.default.json({ limit: "10mb" }));
 app.use(express_1.default.urlencoded({ extended: true, limit: "10mb" }));
+// Local file storage for image uploads (legacy — kept for static serving)
+const UPLOAD_DIR = path_1.default.join(__dirname, "..", "uploads");
+if (!fs_1.default.existsSync(UPLOAD_DIR)) {
+    fs_1.default.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+app.use("/uploads", express_1.default.static(UPLOAD_DIR));
 const uri = process.env.MONGODB_URI || "";
 const dbName = process.env.DB_NAME || "StayEase";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
-// ============================================================
-// CLOUDINARY CONFIG
-// ============================================================
-cloudinary_1.v2.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME || "",
-    api_key: process.env.CLOUDINARY_API_KEY || "",
-    api_secret: process.env.CLOUDINARY_API_SECRET || "",
-});
 // ============================================================
 // STRIPE CONFIG
 // ============================================================
@@ -203,7 +202,7 @@ async function confirmBookingAndCreateTransaction(bookingsCol, transactionsCol, 
     }
 }
 // ============================================================
-// MULTER CONFIG - memory storage (buffer → Cloudinary)
+// MULTER CONFIG - memory storage
 // ============================================================
 const ALLOWED_MIME_TYPES = [
     "image/jpeg",
@@ -539,50 +538,6 @@ function buildPaginationResponse(total, page, limit) {
         hasNextPage: page < totalPages,
         hasPrevPage: page > 1,
     };
-}
-// ✅ Fix 3: explicit Cloudinary callback types (no implicit any)
-async function uploadToCloudinary(buffer, folder, filename) {
-    return new Promise((resolve, reject) => {
-        const stream = cloudinary_1.v2.uploader.upload_stream({
-            folder: `stayease/${folder}`,
-            public_id: filename,
-            overwrite: true,
-            resource_type: "image",
-            transformation: [
-                { width: 1920, height: 1080, crop: "limit" },
-                { quality: "auto:good" },
-                { fetch_format: "auto" },
-            ],
-        }, 
-        // ✅ explicit types for error & result params
-        (error, result) => {
-            if (error || !result) {
-                reject(new Error(error?.message || "Cloudinary upload failed"));
-                return;
-            }
-            resolve({ url: result.secure_url, publicId: result.public_id });
-        });
-        const readable = new stream_1.Readable();
-        readable.push(buffer);
-        readable.push(null);
-        readable.pipe(stream);
-    });
-}
-// Delete by Cloudinary URL
-async function deleteFromCloudinary(imageUrl) {
-    try {
-        const parts = imageUrl.split("/");
-        const uploadIndex = parts.indexOf("upload");
-        if (uploadIndex === -1)
-            return;
-        const afterUpload = parts.slice(uploadIndex + 2).join("/"); // skip "upload/v{version}"
-        const publicId = afterUpload.replace(/\.[^/.]+$/, ""); // remove extension
-        if (publicId)
-            await cloudinary_1.v2.uploader.destroy(publicId);
-    }
-    catch (err) {
-        console.warn("Cloudinary delete warning:", err); // non-critical
-    }
 }
 // ============================================================
 // AI
@@ -1115,8 +1070,8 @@ app.get("/", (_req, res) => {
             hasMongoUri: !!process.env.MONGODB_URI,
             hasDbName: !!process.env.DB_NAME,
             hasFrontendUrl: !!process.env.FRONTEND_URL,
-            hasCloudinary: !!process.env.CLOUDINARY_CLOUD_NAME &&
-                !!process.env.CLOUDINARY_API_KEY,
+            storage: "local",
+            uploadsDir: UPLOAD_DIR,
             nodeEnv: process.env.NODE_ENV || "not set",
         },
     });
@@ -1125,16 +1080,14 @@ app.get("/api/health", async (_req, res) => {
     try {
         const db = await getDb();
         await db.command({ ping: 1 });
-        const cloudinaryOk = !!process.env.CLOUDINARY_CLOUD_NAME &&
-            !!process.env.CLOUDINARY_API_KEY &&
-            !!process.env.CLOUDINARY_API_SECRET;
         res.status(200).json({
             success: true,
             message: "All systems operational",
             services: {
                 mongodb: { status: "connected", database: dbName },
-                cloudinary: {
-                    status: cloudinaryOk ? "configured" : "not configured",
+                storage: {
+                    type: "local",
+                    path: UPLOAD_DIR,
                 },
                 server: { status: "running" },
             },
@@ -1959,17 +1912,9 @@ app.get("/api/properties/host/my-properties", verifyToken, verifyHostOrAdmin, as
         });
     }
 });
-// POST upload images → Cloudinary
+// POST upload images → imgbb
 app.post("/api/properties/upload-images", verifyToken, verifyHostOrAdmin, upload.array("images", MAX_FILES), async (req, res) => {
-    if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
-        res.status(500).json({
-            success: false,
-            message: "Cloudinary is not configured. Please set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in your .env file.",
-        });
-        return;
-    }
     try {
-        // ✅ Fix 4: cast req.files to array (multer attaches it)
         const files = req.files || [];
         if (files.length === 0) {
             res.status(400).json({
@@ -1978,15 +1923,25 @@ app.post("/api/properties/upload-images", verifyToken, verifyHostOrAdmin, upload
             });
             return;
         }
-        const userId = toIdString(req.user._id);
-        const folder = `properties/${userId}`;
         const uploadedUrls = [];
         const errors = [];
-        await Promise.all(files.map(async (file, idx) => {
+        await Promise.all(files.map(async (file) => {
             try {
-                const filename = `img_${Date.now()}_${idx}`;
-                const result = await uploadToCloudinary(file.buffer, folder, filename);
-                uploadedUrls.push(result.url);
+                const key = process.env.IMGBB_API_KEY;
+                let url;
+                if (key) {
+                    try {
+                        url = await uploadToImgbb(file.buffer, file.originalname);
+                    }
+                    catch (err) {
+                        console.warn("[Properties] imgbb failed, local fallback:", err.message);
+                        url = await saveFileLocally(file.buffer, file.originalname);
+                    }
+                }
+                else {
+                    url = await saveFileLocally(file.buffer, file.originalname);
+                }
+                uploadedUrls.push(url);
             }
             catch (err) {
                 errors.push(`File ${file.originalname}: ${err.message}`);
@@ -2011,7 +1966,6 @@ app.post("/api/properties/upload-images", verifyToken, verifyHostOrAdmin, upload
         });
     }
     catch (error) {
-        // Multer-level errors
         if (error.code === "LIMIT_FILE_SIZE") {
             res.status(400).json({
                 success: false,
@@ -2040,7 +1994,7 @@ app.post("/api/properties/upload-images", verifyToken, verifyHostOrAdmin, upload
         });
     }
 });
-// DELETE image from Cloudinary
+// DELETE image from imgbb
 app.delete("/api/properties/delete-image", verifyToken, verifyHostOrAdmin, async (req, res) => {
     try {
         const { imageUrl, propertyId } = req.body;
@@ -2048,16 +2002,6 @@ app.delete("/api/properties/delete-image", verifyToken, verifyHostOrAdmin, async
             res.status(400).json({
                 success: false,
                 message: "imageUrl is required.",
-            });
-            return;
-        }
-        // Must be our Cloudinary account
-        const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-        if (cloudName &&
-            !imageUrl.includes(`res.cloudinary.com/${cloudName}`)) {
-            res.status(400).json({
-                success: false,
-                message: "Invalid image URL.",
             });
             return;
         }
@@ -2085,10 +2029,11 @@ app.delete("/api/properties/delete-image", verifyToken, verifyHostOrAdmin, async
                 return;
             }
         }
-        await deleteFromCloudinary(imageUrl);
+        // imgbb images can't be deleted without the delete_url from upload response
+        // The delete_url is returned during upload but not stored server-side
         res.status(200).json({
             success: true,
-            message: "Image deleted successfully.",
+            message: "Image removed from property (imgbb image will remain hosted).",
         });
     }
     catch {
@@ -6208,24 +6153,31 @@ app.post("/api/blogs", verifyToken, async (req, res) => {
         res.status(500).json({ success: false, message: "Failed to create blog." });
     }
 });
-// POST /api/blogs/upload-cover — upload cover image
+// POST /api/blogs/upload-cover — upload cover image via imgbb
 app.post("/api/blogs/upload-cover", verifyToken, upload.single("cover"), async (req, res) => {
-    if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
-        res.status(500).json({ success: false, message: "Cloudinary is not configured." });
-        return;
-    }
     try {
         const file = req.file;
         if (!file) {
             res.status(400).json({ success: false, message: "No file uploaded." });
             return;
         }
-        const userId = toIdString(req.user._id);
-        const filename = `blog_cover_${Date.now()}`;
-        const result = await uploadToCloudinary(file.buffer, `blogs/${userId}`, filename);
+        const key = process.env.IMGBB_API_KEY;
+        let url;
+        if (key) {
+            try {
+                url = await uploadToImgbb(file.buffer, file.originalname);
+            }
+            catch (err) {
+                console.warn("[Blog] imgbb failed, local fallback:", err.message);
+                url = await saveFileLocally(file.buffer, file.originalname);
+            }
+        }
+        else {
+            url = await saveFileLocally(file.buffer, file.originalname);
+        }
         res.status(200).json({
             success: true,
-            data: { url: result.url },
+            data: { url },
         });
     }
     catch (error) {
@@ -6234,7 +6186,7 @@ app.post("/api/blogs/upload-cover", verifyToken, upload.single("cover"), async (
             return;
         }
         console.error("[BLOGS] Cover upload error:", error);
-        res.status(500).json({ success: false, message: "Failed to upload cover image." });
+        res.status(500).json({ success: false, message: error.message || "Failed to upload cover image." });
     }
 });
 // PUT /api/blogs/:id — update blog (owner or admin)
@@ -6511,10 +6463,22 @@ Content rules:
         // Parse JSON from AI response (strip markdown fences if present)
         let parsed;
         try {
-            const cleaned = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+            let cleaned = raw
+                .replace(/^```(?:json)?\s*/i, "")
+                .replace(/\s*```$/i, "")
+                .replace(/[\x00-\x1F]/g, " ")
+                .trim();
+            const braceStart = cleaned.indexOf("{");
+            if (braceStart > 0)
+                cleaned = cleaned.slice(braceStart);
+            const braceEnd = cleaned.lastIndexOf("}");
+            if (braceEnd > 0)
+                cleaned = cleaned.slice(0, braceEnd + 1);
             parsed = JSON.parse(cleaned);
         }
-        catch {
+        catch (parseErr) {
+            console.error("[AI Blog Generator] Raw response:", raw);
+            console.error("[AI Blog Generator] Parse error:", parseErr?.message);
             res.status(500).json({ success: false, message: "AI returned invalid content. Please try again." });
             return;
         }
@@ -6537,6 +6501,96 @@ Content rules:
         res.status(500).json({ success: false, message: error.message || "Failed to generate blog content." });
     }
 });
+// ============================================================
+// IMGBB HELPER
+// ============================================================
+function detectMime(buffer) {
+    if (buffer[0] === 0xff && buffer[1] === 0xd8)
+        return "image/jpeg";
+    if (buffer[0] === 0x89 && buffer[1] === 0x50)
+        return "image/png";
+    if (buffer[0] === 0x52 && buffer[1] === 0x49)
+        return "image/webp";
+    return "image/jpeg";
+}
+async function uploadToImgbb(buffer, filename) {
+    const mime = detectMime(buffer);
+    const ext = mime === "image/png" ? ".png" : mime === "image/webp" ? ".webp" : ".jpg";
+    const formData = new FormData();
+    formData.append("image", new Blob([buffer], { type: mime }), `upload${ext}`);
+    const res = await fetch(`https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`, { method: "POST", body: formData });
+    const text = await res.text();
+    let data;
+    try {
+        data = JSON.parse(text);
+    }
+    catch {
+        throw new Error(`imgbb: ${text.slice(0, 300)}`);
+    }
+    if (!data.success || !data.data?.url) {
+        throw new Error(data.error?.message || JSON.stringify(data));
+    }
+    return data.data.display_url || data.data.url;
+}
+// Fallback: save locally when imgbb fails (returns relative path, frontend proxies it)
+async function saveFileLocally(buffer, originalname) {
+    const ext = path_1.default.extname(originalname) || ".jpg";
+    const filename = `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
+    const filePath = path_1.default.join(UPLOAD_DIR, filename);
+    fs_1.default.writeFileSync(filePath, buffer);
+    return `/uploads/${filename}`;
+}
+// ============================================================
+// IMAGE UPLOAD (imgbb proxy with local fallback)
+// ============================================================
+async function handleUpload(file, res) {
+    const key = process.env.IMGBB_API_KEY;
+    if (key) {
+        try {
+            const url = await uploadToImgbb(file.buffer, file.originalname);
+            res.status(200).json({ success: true, data: { url } });
+            return;
+        }
+        catch (err) {
+            console.warn("[Upload] imgbb failed, falling back to local:", err.message);
+        }
+    }
+    const url = await saveFileLocally(file.buffer, file.originalname);
+    res.status(200).json({ success: true, data: { url } });
+}
+// Public endpoint — no auth required
+app.post("/api/upload/local", upload.single("image"), async (req, res) => {
+    try {
+        const file = req.file;
+        if (!file) {
+            res.status(400).json({ success: false, message: "No file uploaded." });
+            return;
+        }
+        await handleUpload(file, res);
+    }
+    catch (error) {
+        console.error("[Upload] error:", error);
+        res.status(500).json({ success: false, message: error.message || "Upload failed." });
+    }
+});
+app.post("/api/blogs/upload-cover-local", verifyToken, upload.single("cover"), async (req, res) => {
+    try {
+        const file = req.file;
+        if (!file) {
+            res.status(400).json({ success: false, message: "No file uploaded." });
+            return;
+        }
+        await handleUpload(file, res);
+    }
+    catch (error) {
+        console.error("[Blog] Cover upload error:", error);
+        res.status(500).json({ success: false, message: error.message || "Failed to upload cover image." });
+    }
+});
+// ============================================================
+// AI ROUTES
+// ============================================================
+(0, ai_1.registerAiRoutes)(app, { getDb, verifyToken });
 // ============================================================
 // GLOBAL ERROR HANDLER
 // ============================================================
