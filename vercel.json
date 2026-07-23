@@ -3,7 +3,6 @@
     "buildCommand": "npm run vercel-build",
     "outputDirectory": "dist",
     "devCommand": "npm run dev",
-    "installCommand",
     "framework": null,
     "functions": {
         "dist/index.js": {
