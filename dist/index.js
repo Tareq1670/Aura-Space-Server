@@ -19,7 +19,7 @@ const ai_1 = require("./ai");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const allowedOrigins = [
-    process.env.FRONTEND_URL,
+    process.env.CLIENT_URL,
     "http://localhost:3000",
     "http://localhost:3001",
     "https://aura-space-ochre.vercel.app",
@@ -63,7 +63,7 @@ if (!fs_1.default.existsSync(UPLOAD_DIR)) {
 app.use("/uploads", express_1.default.static(UPLOAD_DIR));
 const uri = process.env.MONGODB_URI || "";
 const dbName = process.env.DB_NAME || "StayEase";
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+const CLIENT_URL = process.env.CLIENT_URL || process.env.FRONTEND_URL || "http://localhost:3000";
 // ============================================================
 // STRIPE CONFIG
 // ============================================================
@@ -444,7 +444,7 @@ const JWKS_TTL_MS = 60 * 60 * 1000; // 1 hour
 function getJWKS() {
     const now = Date.now();
     if (!JWKS || (now - JWKSGeneratedAt) > JWKS_TTL_MS) {
-        JWKS = (0, jose_cjs_1.createRemoteJWKSet)(new URL(`${FRONTEND_URL}/api/auth/jwks`));
+        JWKS = (0, jose_cjs_1.createRemoteJWKSet)(new URL(`${CLIENT_URL}/api/auth/jwks`));
         JWKSGeneratedAt = now;
     }
     return JWKS;
@@ -1069,7 +1069,7 @@ app.get("/", (_req, res) => {
         env: {
             hasMongoUri: !!process.env.MONGODB_URI,
             hasDbName: !!process.env.DB_NAME,
-            hasFrontendUrl: !!process.env.FRONTEND_URL,
+            hasFrontendUrl: !!process.env.CLIENT_URL,
             storage: "local",
             uploadsDir: UPLOAD_DIR,
             nodeEnv: process.env.NODE_ENV || "not set",
@@ -3635,7 +3635,7 @@ app.post("/api/payments/create-checkout-session", verifyToken, async (req, res) 
                 },
             ],
             mode: "payment",
-            return_url: `${FRONTEND_URL}/checkout/return?session_id={CHECKOUT_SESSION_ID}`,
+            return_url: `${CLIENT_URL}/checkout/return?session_id={CHECKOUT_SESSION_ID}`,
             metadata: {
                 bookingId,
                 propertyId: booking.propertyId,
