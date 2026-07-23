@@ -69,8 +69,12 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // Local file storage for image uploads (legacy — kept for static serving)
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
-if (!fs.existsSync(UPLOAD_DIR)) {
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+try {
+    if (!fs.existsSync(UPLOAD_DIR)) {
+        fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    }
+} catch {
+    // Vercel serverless: filesystem is read-only except /tmp — ignore
 }
 app.use("/uploads", express.static(UPLOAD_DIR));
 
