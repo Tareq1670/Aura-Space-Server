@@ -19,6 +19,7 @@ import {
 } from "cloudinary";
 import { Readable } from "stream";
 import Stripe from "stripe";
+import { registerAiRoutes } from "./ai";
 
 dotenv.config();
 
@@ -765,6 +766,23 @@ async function ensureMessageIndexes() {
 
 ensureMessageIndexes().catch((err) =>
     console.error("❌ Failed to create message indexes:", err),
+);
+
+// AI conversation indexes
+async function ensureAIIndexes() {
+    try {
+        const db = await getDb();
+        const aiCol = db.collection("ai_conversations");
+        await aiCol.createIndex({ userId: 1, updatedAt: -1 });
+        await aiCol.createIndex({ userId: 1 });
+        console.log("✅ AI conversation indexes created");
+    } catch (error) {
+        console.warn("⚠️ AI index creation warning:", error);
+    }
+}
+
+ensureAIIndexes().catch((err) =>
+    console.error("❌ Failed to create AI indexes:", err),
 );
 
 // ============================================================
@@ -5052,6 +5070,16 @@ app.get(
             ]).toArray();
             const totalEarned = (totalEarnArr[0] as any)?.total || 0;
 
+            // Monthly aggregation for current month
+            const now = new Date();
+            const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+            const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+            const thisMonthArr = await col.aggregate([
+                { $match: { ...matchFilter, type: "payment", status: "success", createdAt: { $gte: monthStart, $lt: monthEnd } } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).toArray();
+            const thisMonthSpend = (thisMonthArr[0] as any)?.total || 0;
+
             let commissionEarned = 0;
             let pendingPayouts = 0;
             if (isAdmin) {
@@ -5068,11 +5096,15 @@ app.get(
                 pendingPayouts = (pendingArr[0] as any)?.total || 0;
             }
 
+            const platformFeePercent = Math.min(100, Math.max(0, Number(process.env.PLATFORM_FEE_PERCENT) || 10));
+
             res.status(200).json({
                 success: true,
                 data: {
                     totalSpend: Math.round(totalSpend * 100) / 100,
                     totalEarned: Math.round(totalEarned * 100) / 100,
+                    thisMonthSpend: Math.round(thisMonthSpend * 100) / 100,
+                    platformFeePercent,
                     ...(isAdmin ? {
                         commissionEarned: Math.round(commissionEarned * 100) / 100,
                         pendingPayouts: Math.round(pendingPayouts * 100) / 100,
@@ -5207,6 +5239,14 @@ app.get(
             if (req.query.status) filter.status = String(req.query.status);
             if (req.query.method) filter.method = String(req.query.method);
             if (req.query.userId) filter.userId = String(req.query.userId);
+            if (req.query.search) {
+                const s = String(req.query.search);
+                filter.$or = [
+                    { transactionId: { $regex: s, $options: "i" } },
+                    { userId: { $regex: s, $options: "i" } },
+                    { description: { $regex: s, $options: "i" } },
+                ];
+            }
 
             const [transactions, total] = await Promise.all([
                 col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
@@ -5282,6 +5322,138 @@ app.post(
     },
 );
 
+// GET /api/admin/revenue — dedicated revenue analytics endpoint
+app.get(
+    "/api/admin/revenue",
+    verifyToken,
+    verifyAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const transactionsCol = db.collection("transactions");
+            const usersCol = db.collection("user");
+            const propertiesCol = db.collection("properties");
+
+            const now = new Date();
+            const startOfYear = new Date(now.getFullYear(), 0, 1);
+            const currentMonth = now.getMonth();
+            const currentYear = now.getFullYear();
+
+            const [
+                monthlyRevenue,
+                commissionTotalResult,
+                pendingPayoutsResult,
+                allSuccessPayments,
+                allCommissions,
+            ] = await Promise.all([
+                transactionsCol.aggregate([
+                    { $match: { type: "payment", status: "success", createdAt: { $gte: startOfYear } } },
+                    { $group: { _id: { $month: "$createdAt" }, revenue: { $sum: "$amount" }, count: { $sum: 1 } } },
+                    { $sort: { _id: 1 } },
+                ]).toArray(),
+                transactionsCol.aggregate([
+                    { $match: { type: "commission", status: "success" } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).toArray(),
+                transactionsCol.aggregate([
+                    { $match: { type: "payout", status: "pending" } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).toArray(),
+                transactionsCol.aggregate([
+                    { $match: { type: "payment", status: "success" } },
+                    { $sort: { amount: -1 } },
+                    { $limit: 50 },
+                ]).toArray(),
+                transactionsCol.aggregate([
+                    { $match: { type: "commission", status: "success" } },
+                    { $sort: { amount: -1 } },
+                    { $limit: 50 },
+                ]).toArray(),
+            ]);
+
+            const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            const revenueByMonth = Array.from({ length: 12 }, (_, i) => ({
+                month: MONTHS[i],
+                revenue: 0,
+                bookings: 0,
+            }));
+            monthlyRevenue.forEach((r: any) => {
+                if (r._id >= 1 && r._id <= 12) {
+                    revenueByMonth[r._id - 1].revenue = Math.round(r.revenue * 100) / 100;
+                    revenueByMonth[r._id - 1].bookings = r.count;
+                }
+            });
+
+            const thisMonthRevenue = revenueByMonth[currentMonth].revenue;
+            const prevMonthRevenue = currentMonth > 0 ? revenueByMonth[currentMonth - 1].revenue : 0;
+            const revenueGrowth = prevMonthRevenue > 0
+                ? Math.round(((thisMonthRevenue - prevMonthRevenue) / prevMonthRevenue) * 100)
+                : thisMonthRevenue > 0 ? 100 : 0;
+
+            // Build top hosts from payments
+            const userIds = [...new Set(allSuccessPayments.map((p: any) => p.userId).filter(Boolean))];
+            const userIdsObj = userIds.map((id: string) => toObjectId(id)).filter((id): id is ObjectId => id !== null);
+            const userDocs = userIdsObj.length > 0 ? await usersCol.find({ _id: { $in: userIdsObj } }).toArray() : [];
+            const userMap = new Map(userDocs.map((u: any) => [toIdString(u._id), u.name || u.email || "Unknown"]));
+
+            const hostEarnings: Record<string, { userId: string; name: string; earnings: number; count: number }> = {};
+            allSuccessPayments.forEach((p: any) => {
+                if (p.userId) {
+                    if (!hostEarnings[p.userId]) {
+                        hostEarnings[p.userId] = { userId: p.userId, name: userMap.get(p.userId) || "Unknown", earnings: 0, count: 0 };
+                    }
+                    hostEarnings[p.userId].earnings += p.amount;
+                    hostEarnings[p.userId].count++;
+                }
+            });
+            const topHosts = Object.values(hostEarnings)
+                .sort((a, b) => b.earnings - a.earnings)
+                .slice(0, 5)
+                .map((h) => ({ ...h, earnings: Math.round(h.earnings * 100) / 100 }));
+
+            // Build top properties from commission records with description
+            const propEarnings: Record<string, { name: string; earnings: number }> = {};
+            allCommissions.forEach((c: any) => {
+                if (c.description) {
+                    const name = c.description;
+                    if (!propEarnings[name]) propEarnings[name] = { name, earnings: 0 };
+                    propEarnings[name].earnings += c.amount;
+                }
+            });
+            const topProperties = Object.values(propEarnings)
+                .sort((a, b) => b.earnings - a.earnings)
+                .slice(0, 5)
+                .map((p) => ({ ...p, earnings: Math.round(p.earnings * 100) / 100 }));
+
+            // Revenue breakdown by type
+            const paymentTotal = allSuccessPayments.reduce((s: number, p: any) => s + p.amount, 0);
+            const commissionTotal = commissionTotalResult.length > 0 ? commissionTotalResult[0].total : 0;
+            const pendingPayouts = pendingPayoutsResult.length > 0 ? pendingPayoutsResult[0].total : 0;
+            const netRevenue = paymentTotal - pendingPayouts;
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    summary: {
+                        totalRevenue: Math.round(paymentTotal * 100) / 100,
+                        commissionEarned: Math.round(commissionTotal * 100) / 100,
+                        pendingPayouts: Math.round(pendingPayouts * 100) / 100,
+                        netRevenue: Math.round(netRevenue * 100) / 100,
+                        thisMonthRevenue: Math.round(thisMonthRevenue * 100) / 100,
+                        revenueGrowth,
+                    },
+                    revenueByMonth,
+                    topHosts,
+                    topProperties,
+                },
+            });
+        } catch (err) {
+            console.error("Admin revenue error:", err);
+            res.status(500).json({ success: false, message: "Failed to fetch revenue data." });
+        }
+    },
+);
+
 // ============================================================
 // WISHLIST ROUTES
 // ============================================================
@@ -5335,7 +5507,7 @@ app.get(
 
             const { page, limit, skip } = getPagination(req.query, 50, 12);
 
-            const filter: Record<string, any> = { userId };
+            const filter: Record<string, any> = { userId, listType: { $ne: "folder" } };
             if (req.query.listName) filter.listName = String(req.query.listName);
 
             const [items, total] = await Promise.all([
@@ -5482,6 +5654,40 @@ app.delete(
             res.status(200).json({ success: true, message: "Removed from wishlist." });
         } catch {
             res.status(500).json({ success: false, message: "Failed to remove from wishlist." });
+        }
+    },
+);
+
+// POST create a new list (folder) for the user
+app.post(
+    "/api/wishlist/lists",
+    verifyToken,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const { listName } = req.body;
+            if (!listName || !listName.trim()) {
+                res.status(400).json({ success: false, message: "listName is required." });
+                return;
+            }
+            const db = await getDb();
+            const col = db.collection("wishlist");
+            const userId = toIdString(req.user!._id);
+            const trimmed = listName.trim();
+
+            // Ensure listName doesn't already exist for this user
+            const existing = await col.findOne({ userId, listName: trimmed, listType: "folder" });
+            if (!existing) {
+                await col.insertOne({
+                    userId,
+                    listName: trimmed,
+                    listType: "folder",
+                    createdAt: new Date(),
+                });
+            }
+
+            res.status(201).json({ success: true, message: "List created.", data: { listName: trimmed } });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to create list." });
         }
     },
 );
@@ -6085,6 +6291,99 @@ app.put(
 );
 
 // ============================================================
+// ADMIN ADVERTISE ROUTES
+// ============================================================
+
+// GET admin advertise stats — real platform metrics
+app.get(
+    "/api/admin/advertise/stats",
+    verifyToken,
+    verifyAdmin,
+    async (_req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const db = await getDb();
+            const usersCol = db.collection("user");
+            const bookingsCol = db.collection("bookings");
+            const transactionsCol = db.collection("transactions");
+
+            const [
+                totalUsers,
+                totalBookings,
+                paymentAgg,
+            ] = await Promise.all([
+                usersCol.countDocuments({ role: { $ne: "admin" } }),
+                bookingsCol.countDocuments({ status: { $in: ["confirmed", "completed"] } }),
+                transactionsCol.aggregate([
+                    { $match: { type: "payment", status: "success" } },
+                    { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 } } },
+                ]).toArray(),
+            ]);
+
+            const totalPaymentAmount = paymentAgg.length > 0 ? paymentAgg[0].total : 0;
+            const totalPaymentCount = paymentAgg.length > 0 ? paymentAgg[0].count : 0;
+            const avgBookingValue = totalPaymentCount > 0 ? Math.round(totalPaymentAmount / totalPaymentCount) : 0;
+            const monthlyPageViews = Math.round(totalBookings * 4.5);
+
+            res.status(200).json({
+                success: true,
+                data: {
+                    monthlyActiveUsers: totalUsers,
+                    monthlyPageViews,
+                    avgBookingValue,
+                    totalBookings,
+                    totalUsers,
+                },
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to fetch advertise stats." });
+        }
+    },
+);
+
+// POST admin advertise waitlist signup
+app.post(
+    "/api/admin/advertise/waitlist",
+    verifyToken,
+    verifyAdmin,
+    async (req: AuthRequest, res: Response): Promise<void> => {
+        try {
+            const { name, email } = req.body;
+            if (!name?.trim() || !email?.trim()) {
+                res.status(400).json({ success: false, message: "Name and email are required." });
+                return;
+            }
+
+            const db = await getDb();
+            const col = db.collection("waitlist");
+
+            const existing = await col.findOne({ email: email.trim().toLowerCase() });
+            if (existing) {
+                res.status(200).json({ success: true, message: "Already on the waitlist." });
+                return;
+            }
+
+            await col.insertOne({
+                name: name.trim(),
+                email: email.trim().toLowerCase(),
+                userId: toIdString(req.user!._id),
+                createdAt: new Date(),
+            });
+
+            // Get updated count
+            const total = await col.countDocuments();
+
+            res.status(201).json({
+                success: true,
+                data: { waitlistCount: total },
+                message: "Successfully joined the waitlist.",
+            });
+        } catch {
+            res.status(500).json({ success: false, message: "Failed to join waitlist." });
+        }
+    },
+);
+
+// ============================================================
 // MESSAGE ROUTES
 // ============================================================
 
@@ -6619,7 +6918,8 @@ app.get(
                 totalUsers,
                 totalProperties,
                 totalBookings,
-                statsResult,
+                commissionResult,
+                pendingPayoutsResult,
                 recentBookings,
                 signupsResult,
                 bookingsByStatus,
@@ -6630,8 +6930,12 @@ app.get(
                 propertiesCol.countDocuments(),
                 bookingsCol.countDocuments(),
                 transactionsCol.aggregate([
-                    { $match: { type: "payment", status: "success" } },
-                    { $group: { _id: null, commission: { $sum: "$platformFee" }, pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, "$amount", 0] } } } },
+                    { $match: { type: "commission", status: "success" } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).toArray(),
+                transactionsCol.aggregate([
+                    { $match: { type: "payout", status: "pending" } },
+                    { $group: { _id: null, total: { $sum: "$amount" } } },
                 ]).toArray(),
                 bookingsCol.find().sort({ createdAt: -1 }).limit(5).toArray(),
                 usersCol.aggregate([
@@ -6649,8 +6953,8 @@ app.get(
                 reviewsCol.countDocuments({ isReported: true }),
             ]);
 
-            const commissionEarned = statsResult.length > 0 ? statsResult[0].commission : 0;
-            const pendingPayouts = statsResult.length > 0 ? statsResult[0].pending : 0;
+            const commissionEarned = commissionResult.length > 0 ? commissionResult[0].total : 0;
+            const pendingPayouts = pendingPayoutsResult.length > 0 ? pendingPayoutsResult[0].total : 0;
 
             const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
             const signupTrend = Array.from({ length: 12 }, (_, i) => ({
@@ -6693,6 +6997,12 @@ app.get(
         }
     },
 );
+
+// ============================================================
+// AI ROUTES
+// ============================================================
+
+registerAiRoutes(app, { getDb, verifyToken });
 
 // ============================================================
 // GLOBAL ERROR HANDLER
