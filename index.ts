@@ -1633,7 +1633,7 @@ const verifyHostOrAdmin = (
 app.get("/", (_req: Request, res: Response) => {
     res.status(200).json({
         success: true,
-        message: "🏡 StayEase Server is Running!",
+        message: "🏡 AuraSpace Server is Running!",
         version: "1.0.0",
         env: {
             hasMongoUri: !!process.env.MONGODB_URI,
@@ -4737,7 +4737,7 @@ app.post(
                         price_data: {
                             currency,
                             product_data: {
-                                name: booking.propertyTitle || "StayEase Booking",
+                                name: booking.propertyTitle || "AuraSpace Booking",
                                 images: booking.propertyImage ? [booking.propertyImage] : [],
                             },
                             unit_amount: Math.round(booking.totalAmount * 100),
@@ -7136,7 +7136,7 @@ app.get(
                 pastReviews: reviews.map((r: any) => ({ rating: r.rating, propertyId: r.propertyId })),
             };
 
-            const systemPrompt = `You are a property recommendation AI for StayEase (AuraSpace).
+            const systemPrompt = `You are a property recommendation AI for AuraSpace.
 Analyze the user's profile and preferences against available listings. For each match, provide a concise personalized reason.
 
 USER PREFERENCES:
@@ -7231,7 +7231,7 @@ app.post(
 
             const bookingCount = await bookingsCol.countDocuments({ guestId: userId });
 
-            const systemPrompt = `You are a helpful AI assistant for StayEase (AuraSpace), a property rental platform.
+            const systemPrompt = `You are a helpful AI assistant for AuraSpace, a property rental platform.
 You help users find properties, with booking guidance, and platform navigation.
 
 RULES:
@@ -7330,7 +7330,7 @@ app.post(
 
             const bookingCount = await bookingsCol.countDocuments({ guestId: userId });
 
-            const systemPrompt = `You are a helpful AI assistant for StayEase (AuraSpace), a property rental platform.
+            const systemPrompt = `You are a helpful AI assistant for AuraSpace, a property rental platform.
 Keep responses concise (2-4 sentences). Be friendly and professional.
 
 USER CONTEXT:
