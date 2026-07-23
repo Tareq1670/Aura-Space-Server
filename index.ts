@@ -23,7 +23,7 @@ dotenv.config();
 const app = express();
 
 const allowedOrigins = [
-    process.env.FRONTEND_URL,
+    process.env.CLIENT_URL,
     "http://localhost:3000",
     "http://localhost:3001",
     "https://aura-space-ochre.vercel.app",
@@ -76,7 +76,7 @@ app.use("/uploads", express.static(UPLOAD_DIR));
 
 const uri: string = process.env.MONGODB_URI || "";
 const dbName: string = process.env.DB_NAME || "StayEase";
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 
 // ============================================================
 // STRIPE CONFIG
@@ -790,7 +790,7 @@ const JWKS_TTL_MS = 60 * 60 * 1000; // 1 hour
 function getJWKS() {
     const now = Date.now();
     if (!JWKS || (now - JWKSGeneratedAt) > JWKS_TTL_MS) {
-        JWKS = createRemoteJWKSet(new URL(`${FRONTEND_URL}/api/auth/jwks`));
+        JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
         JWKSGeneratedAt = now;
     }
     return JWKS;
@@ -1637,7 +1637,7 @@ app.get("/", (_req: Request, res: Response) => {
         env: {
             hasMongoUri: !!process.env.MONGODB_URI,
             hasDbName: !!process.env.DB_NAME,
-            hasFrontendUrl: !!process.env.FRONTEND_URL,
+            hasFrontendUrl: !!process.env.CLIENT_URL,
             storage: "local",
             uploadsDir: UPLOAD_DIR,
             nodeEnv: process.env.NODE_ENV || "not set",
@@ -4723,7 +4723,7 @@ app.post(
                     },
                 ],
                 mode: "payment",
-                return_url: `${FRONTEND_URL}/checkout/return?session_id={CHECKOUT_SESSION_ID}`,
+                return_url: `${CLIENT_URL}/checkout/return?session_id={CHECKOUT_SESSION_ID}`,
                 metadata: {
                     bookingId,
                     propertyId: booking.propertyId,
