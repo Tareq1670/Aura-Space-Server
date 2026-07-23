@@ -3,5 +3,10 @@
     "buildCommand": "npm run vercel-build",
     "outputDirectory": "dist",
     "devCommand": "npm run dev",
-    "framework": null
+    "framework": null,
+    "functions": {
+        "dist/index.js": {
+            "maxDuration": 30
+        }
+    }
 }

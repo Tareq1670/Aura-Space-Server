@@ -40,7 +40,7 @@ app.use(
                 styleSrc: ["'self'", "'unsafe-inline'"],
                 fontSrc: ["'self'"],
                 objectSrc: ["'none'"],
-                frameSrc: ["'none'"],
+                frameSrc: ["'self'", "https://js.stripe.com", "https://hooks.stripe.com"],
             },
         },
     }),
