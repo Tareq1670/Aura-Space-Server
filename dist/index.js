@@ -598,6 +598,7 @@ function getGroq() {
     return _groq;
 }
 const AI_MODEL = "llama-3.3-70b-versatile";
+const AI_MODEL_FALLBACKS = ["llama-3.1-8b-instant", "gemma2-9b-it", "llama-3.1-8b-versatile"];
 function generateSuggestions(userMessage, aiReply) {
     const lower = userMessage.toLowerCase();
     const suggestions = [];
@@ -622,6 +623,40 @@ function generateSuggestions(userMessage, aiReply) {
         suggestions.push("How to book a property");
     }
     return suggestions.slice(0, 3);
+}
+function stripHtml(html) {
+    return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+function calculateReadingTime(content) {
+    const words = stripHtml(content).split(/\s+/).length;
+    return Math.max(1, Math.ceil(words / 200));
+}
+function generateSlug(title) {
+    return title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 80);
+}
+function buildBlogResponse(blog) {
+    return {
+        id: blog._id?.toString() || "",
+        title: blog.title,
+        slug: blog.slug,
+        content: blog.content,
+        excerpt: blog.excerpt,
+        coverImage: blog.coverImage,
+        tags: blog.tags,
+        authorId: blog.authorId,
+        authorName: blog.authorName,
+        authorImage: blog.authorImage,
+        status: blog.status,
+        isFeatured: blog.isFeatured,
+        viewCount: blog.viewCount,
+        readingTime: blog.readingTime,
+        createdAt: blog.createdAt,
+        updatedAt: blog.updatedAt,
+    };
 }
 // ============================================================
 // BOOKING HELPERS
@@ -1074,7 +1109,7 @@ const verifyHostOrAdmin = (req, res, next) => {
 app.get("/", (_req, res) => {
     res.status(200).json({
         success: true,
-        message: "🏡 StayEase Server is Running!",
+        message: "🏡 AuraSpace Server is Running!",
         version: "1.0.0",
         env: {
             hasMongoUri: !!process.env.MONGODB_URI,
@@ -5593,13 +5628,29 @@ ${JSON.stringify(propertyList, null, 2)}
 
 Respond with ONLY a valid JSON array (no markdown):
 [{"propertyId":"...","title":"...","reason":"..."}]`;
-        const completion = await groq.chat.completions.create({
-            messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: "Recommend the best properties based on my preferences and history." },
-            ],
-            model: AI_MODEL, temperature: 0.4, max_tokens: 2048,
-        });
+        const recModels = [AI_MODEL, ...AI_MODEL_FALLBACKS];
+        let completion = null;
+        for (const model of recModels) {
+            try {
+                completion = await groq.chat.completions.create({
+                    messages: [
+                        { role: "system", content: systemPrompt },
+                        { role: "user", content: "Recommend the best properties based on my preferences and history." },
+                    ],
+                    model, temperature: 0.4,
+                });
+                break;
+            }
+            catch (e) {
+                if (e?.status === 429 || e?.message?.includes("rate limit"))
+                    continue;
+                throw e;
+            }
+        }
+        if (!completion) {
+            res.status(429).json({ success: false, message: "AI service is experiencing high demand. Please try again in a few minutes." });
+            return;
+        }
         const raw = completion.choices[0]?.message?.content || "[]";
         let recommendations;
         try {
@@ -5630,82 +5681,136 @@ Respond with ONLY a valid JSON array (no markdown):
         res.status(500).json({ success: false, message: error.message || "Failed to generate recommendations." });
     }
 });
-// POST /api/ai/chat
-app.post("/api/ai/chat", verifyToken, async (req, res) => {
+// POST /api/ai/chat — works with or without auth; saves history only when logged in
+app.post("/api/ai/chat", async (req, res) => {
     try {
         const groq = getGroq();
         if (!groq) {
             res.status(503).json({ success: false, message: "AI service not configured." });
             return;
         }
-        const userId = req.user._id.toString();
-        const userName = req.user.name;
-        const userRole = req.user.role;
+        // Optional auth: try to identify user but don't block
+        let userId = null;
+        let userName = "Guest";
+        let userRole = "guest";
+        const authHeader = req.headers.authorization;
+        if (authHeader?.startsWith("Bearer ")) {
+            try {
+                const token = authHeader.substring(7).trim();
+                if (token) {
+                    const { payload } = await (0, jose_cjs_1.jwtVerify)(token, getJWKS());
+                    const jwtPayload = payload;
+                    if (jwtPayload.sub) {
+                        const db = await getDb();
+                        const user = await findUserById(db.collection("user"), jwtPayload.sub);
+                        if (user && !user.banned) {
+                            userId = user._id.toString();
+                            userName = user.name;
+                            userRole = user.role;
+                        }
+                    }
+                }
+            }
+            catch {
+                // Token invalid/expired — continue as guest
+            }
+        }
         const { message, conversationId } = req.body;
         if (!message || typeof message !== "string") {
             res.status(400).json({ success: false, message: "Message is required." });
             return;
         }
-        const db = await getDb();
-        const aiConvoCol = db.collection("ai_conversations");
-        const bookingsCol = db.collection("bookings");
-        let conversation = null;
-        if (conversationId) {
-            const oid = new mongodb_1.ObjectId(conversationId);
-            conversation = await aiConvoCol.findOne({ _id: oid, userId });
+        let conversationHistory = [];
+        let conversationIdOut = null;
+        // Load conversation history only if user is logged in
+        if (userId) {
+            const db = await getDb();
+            const aiConvoCol = db.collection("ai_conversations");
+            let conversation = null;
+            if (conversationId) {
+                const oid = new mongodb_1.ObjectId(conversationId);
+                conversation = await aiConvoCol.findOne({ _id: oid, userId });
+            }
+            if (!conversation) {
+                conversation = { userId, messages: [], createdAt: new Date(), updatedAt: new Date() };
+                const result = await aiConvoCol.insertOne(conversation);
+                conversation._id = result.insertedId;
+            }
+            conversationHistory = conversation.messages;
+            conversationIdOut = conversation._id.toString();
         }
-        if (!conversation) {
-            conversation = { userId, messages: [], createdAt: new Date(), updatedAt: new Date() };
-            const result = await aiConvoCol.insertOne(conversation);
-            conversation._id = result.insertedId;
-        }
-        const bookingCount = await bookingsCol.countDocuments({ guestId: userId });
-        const systemPrompt = `You are a helpful AI assistant for AuraSpace, a property rental platform.
-You help users find properties, with booking guidance, and platform navigation.
-
-RULES:
-- Keep responses concise (2-4 sentences).
-- If the user asks about finding properties, ask about their location, budget, guests, and preferences.
-- For navigation questions, give clear step-by-step instructions.
-- Be friendly, professional, and helpful.
-- If you don't know something, say so honestly.
-
-USER CONTEXT:
-- Name: ${userName}
-- Role: ${userRole}
-- Active Bookings: ${bookingCount}`;
+        const systemPrompt = `You are AuraSpace AI, a helpful assistant for a property rental platform. Be concise (1-3 sentences), friendly, and helpful. For property searches, ask about location, budget, and guests. For navigation, give brief step-by-step instructions.`;
         const messages = [
             { role: "system", content: systemPrompt },
-            ...conversation.messages.slice(-20).map((m) => ({
+            ...conversationHistory.slice(-10).map((m) => ({
                 role: m.role,
                 content: m.content,
             })),
             { role: "user", content: message },
         ];
-        const completion = await groq.chat.completions.create({
-            messages, model: AI_MODEL, temperature: 0.6, max_tokens: 1024,
-        });
+        const models = [AI_MODEL, ...AI_MODEL_FALLBACKS];
+        let completion = null;
+        let lastError = null;
+        for (const model of models) {
+            try {
+                completion = await groq.chat.completions.create({
+                    messages, model, temperature: 0.6,
+                });
+                break;
+            }
+            catch (groqError) {
+                lastError = groqError;
+                if (groqError?.status === 429 || groqError?.message?.includes("rate limit")) {
+                    console.warn(`[AI Chat] Model ${model} rate limited, trying next...`);
+                    continue;
+                }
+                throw groqError;
+            }
+        }
+        if (!completion) {
+            res.status(429).json({
+                success: false,
+                message: "AI service is experiencing high demand. Please try again in a few minutes.",
+            });
+            return;
+        }
         const reply = completion.choices[0]?.message?.content || "I'm sorry, I couldn't generate a response.";
-        const now = new Date();
-        await aiConvoCol.updateOne({ _id: conversation._id }, {
-            $push: {
-                messages: {
-                    $each: [
-                        { role: "user", content: message, createdAt: now },
-                        { role: "assistant", content: reply, createdAt: now },
-                    ],
+        // Save to DB only if user is logged in
+        if (userId && conversationIdOut) {
+            const db = await getDb();
+            const aiConvoCol = db.collection("ai_conversations");
+            const now = new Date();
+            await aiConvoCol.updateOne({ _id: new mongodb_1.ObjectId(conversationIdOut) }, {
+                $push: {
+                    messages: {
+                        $each: [
+                            { role: "user", content: message, createdAt: now },
+                            { role: "assistant", content: reply, createdAt: now },
+                        ],
+                    },
                 },
-            },
-            $set: { updatedAt: now },
-        });
+                $set: { updatedAt: now },
+            });
+        }
         const suggestions = generateSuggestions(message, reply);
         res.status(200).json({
             success: true,
-            data: { reply, conversationId: conversation._id.toString(), suggestions },
+            data: {
+                reply,
+                conversationId: conversationIdOut,
+                suggestions,
+            },
         });
     }
     catch (error) {
         console.error("[AI Chat] Error:", error);
+        if (error?.status === 429 || error?.message?.includes("rate limit")) {
+            res.status(429).json({
+                success: false,
+                message: "AI service is experiencing high demand. Please try again in a few minutes.",
+            });
+            return;
+        }
         res.status(500).json({ success: false, message: error.message || "Failed to process chat message." });
     }
 });
@@ -5899,19 +6004,537 @@ TONE: ${toneGuide[tone] || toneGuide.professional}
 LENGTH: ${lengthGuide[length] || lengthGuide.medium}
 
 Write only the description, no title or prefix.`;
-        const completion = await groq.chat.completions.create({
-            messages: [
-                { role: "system", content: "You are a professional copywriter specializing in property listings. Write engaging, accurate descriptions that highlight key features." },
-                { role: "user", content: prompt },
-            ],
-            model: AI_MODEL, temperature: 0.7, max_tokens: 1024,
-        });
+        const descModels = [AI_MODEL, ...AI_MODEL_FALLBACKS];
+        let completion = null;
+        for (const model of descModels) {
+            try {
+                completion = await groq.chat.completions.create({
+                    messages: [
+                        { role: "system", content: "You are a professional copywriter specializing in property listings. Write engaging, accurate descriptions that highlight key features." },
+                        { role: "user", content: prompt },
+                    ],
+                    model, temperature: 0.7,
+                });
+                break;
+            }
+            catch (e) {
+                if (e?.status === 429 || e?.message?.includes("rate limit"))
+                    continue;
+                throw e;
+            }
+        }
+        if (!completion) {
+            res.status(429).json({ success: false, message: "AI service is experiencing high demand. Please try again in a few minutes." });
+            return;
+        }
         const description = completion.choices[0]?.message?.content?.trim() || "";
         res.status(200).json({ success: true, data: { description } });
     }
     catch (error) {
         console.error("[AI Description] Error:", error);
         res.status(500).json({ success: false, message: error.message || "Failed to generate description." });
+    }
+});
+// ============================================================
+// BLOG ROUTES
+// ============================================================
+// GET /api/blogs — public, paginated, filterable
+app.get("/api/blogs", async (req, res) => {
+    try {
+        const db = await getDb();
+        const col = db.collection("blogs");
+        const { page, limit, skip } = getPagination(req.query, 50, 12);
+        const filter = { status: "published" };
+        if (req.query.tag) {
+            const tag = String(req.query.tag).trim().toLowerCase();
+            if (tag)
+                filter.tags = tag;
+        }
+        if (req.query.search) {
+            const term = String(req.query.search).trim().slice(0, 100);
+            if (term) {
+                filter.$or = [
+                    { title: { $regex: escapeRegex(term), $options: "i" } },
+                    { excerpt: { $regex: escapeRegex(term), $options: "i" } },
+                    { tags: { $regex: escapeRegex(term), $options: "i" } },
+                ];
+            }
+        }
+        let sort = { createdAt: -1 };
+        if (req.query.sort === "popular")
+            sort = { viewCount: -1 };
+        const [blogs, total] = await Promise.all([
+            col.find(filter).sort(sort).skip(skip).limit(limit).toArray(),
+            col.countDocuments(filter),
+        ]);
+        res.status(200).json({
+            success: true,
+            data: {
+                blogs: blogs.map(buildBlogResponse),
+                pagination: buildPaginationResponse(total, page, limit),
+            },
+        });
+    }
+    catch (error) {
+        console.error("[BLOGS] List error:", error);
+        res.status(500).json({ success: false, message: "Failed to fetch blogs." });
+    }
+});
+// GET /api/blogs/featured — for homepage
+app.get("/api/blogs/featured", async (_req, res) => {
+    try {
+        const db = await getDb();
+        const col = db.collection("blogs");
+        const blogs = await col
+            .find({ status: "published", isFeatured: true })
+            .sort({ createdAt: -1 })
+            .limit(6)
+            .toArray();
+        res.status(200).json({
+            success: true,
+            data: { blogs: blogs.map(buildBlogResponse) },
+        });
+    }
+    catch (error) {
+        console.error("[BLOGS] Featured error:", error);
+        res.status(500).json({ success: false, message: "Failed to fetch featured blogs." });
+    }
+});
+// GET /api/blogs/my/blogs — current user's blogs (must come before /:slug)
+app.get("/api/blogs/my/blogs", verifyToken, async (req, res) => {
+    try {
+        const db = await getDb();
+        const col = db.collection("blogs");
+        const userId = toIdString(req.user._id);
+        const { page, limit, skip } = getPagination(req.query, 50, 12);
+        const filter = { authorId: userId };
+        if (req.query.status && ["published", "draft"].includes(String(req.query.status))) {
+            filter.status = String(req.query.status);
+        }
+        const [blogs, total] = await Promise.all([
+            col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+            col.countDocuments(filter),
+        ]);
+        res.status(200).json({
+            success: true,
+            data: {
+                blogs: blogs.map(buildBlogResponse),
+                pagination: buildPaginationResponse(total, page, limit),
+            },
+        });
+    }
+    catch (error) {
+        console.error("[BLOGS] My blogs error:", error);
+        res.status(500).json({ success: false, message: "Failed to fetch your blogs." });
+    }
+});
+// GET /api/blogs/:slug — single blog by slug (increments view count)
+app.get("/api/blogs/:slug", async (req, res) => {
+    try {
+        const slug = String(req.params.slug || "").trim();
+        if (!slug) {
+            res.status(400).json({ success: false, message: "Slug is required." });
+            return;
+        }
+        const db = await getDb();
+        const col = db.collection("blogs");
+        const blog = await col.findOne({ slug, status: "published" });
+        if (!blog) {
+            res.status(404).json({ success: false, message: "Blog not found." });
+            return;
+        }
+        await col.updateOne({ _id: blog._id }, { $inc: { viewCount: 1 } });
+        res.status(200).json({
+            success: true,
+            data: { blog: buildBlogResponse(blog) },
+        });
+    }
+    catch (error) {
+        console.error("[BLOGS] Detail error:", error);
+        res.status(500).json({ success: false, message: "Failed to fetch blog." });
+    }
+});
+// POST /api/blogs — create new blog (any logged-in user)
+app.post("/api/blogs", verifyToken, async (req, res) => {
+    try {
+        const { title, content, excerpt, tags, coverImage, status } = req.body;
+        if (!title || typeof title !== "string" || title.trim().length < 3) {
+            res.status(400).json({ success: false, message: "Title must be at least 3 characters." });
+            return;
+        }
+        if (!content || typeof content !== "string" || stripHtml(content).length < 10) {
+            res.status(400).json({ success: false, message: "Content must be at least 10 characters." });
+            return;
+        }
+        const db = await getDb();
+        const col = db.collection("blogs");
+        // Generate unique slug
+        let baseSlug = generateSlug(title.trim());
+        let slug = baseSlug;
+        let suffix = 1;
+        while (await col.findOne({ slug })) {
+            slug = `${baseSlug}-${suffix}`;
+            suffix++;
+        }
+        const user = req.user;
+        const newBlog = {
+            title: title.trim(),
+            slug,
+            content: content.trim(),
+            excerpt: excerpt?.trim()?.slice(0, 300) || stripHtml(content).slice(0, 200),
+            coverImage: coverImage || null,
+            tags: Array.isArray(tags)
+                ? tags.map((t) => String(t).trim().toLowerCase()).filter(Boolean).slice(0, 10)
+                : [],
+            authorId: toIdString(user._id),
+            authorName: user.name,
+            authorImage: user.image || null,
+            status: status === "draft" ? "draft" : "published",
+            isFeatured: false,
+            viewCount: 0,
+            readingTime: calculateReadingTime(content),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+        const result = await col.insertOne(newBlog);
+        res.status(201).json({
+            success: true,
+            message: "Blog created successfully.",
+            data: buildBlogResponse({ ...newBlog, _id: result.insertedId }),
+        });
+    }
+    catch (error) {
+        console.error("[BLOGS] Create error:", error);
+        res.status(500).json({ success: false, message: "Failed to create blog." });
+    }
+});
+// POST /api/blogs/upload-cover — upload cover image
+app.post("/api/blogs/upload-cover", verifyToken, upload.single("cover"), async (req, res) => {
+    if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+        res.status(500).json({ success: false, message: "Cloudinary is not configured." });
+        return;
+    }
+    try {
+        const file = req.file;
+        if (!file) {
+            res.status(400).json({ success: false, message: "No file uploaded." });
+            return;
+        }
+        const userId = toIdString(req.user._id);
+        const filename = `blog_cover_${Date.now()}`;
+        const result = await uploadToCloudinary(file.buffer, `blogs/${userId}`, filename);
+        res.status(200).json({
+            success: true,
+            data: { url: result.url },
+        });
+    }
+    catch (error) {
+        if (error.code === "LIMIT_FILE_SIZE") {
+            res.status(400).json({ success: false, message: "File too large. Max 5MB." });
+            return;
+        }
+        console.error("[BLOGS] Cover upload error:", error);
+        res.status(500).json({ success: false, message: "Failed to upload cover image." });
+    }
+});
+// PUT /api/blogs/:id — update blog (owner or admin)
+app.put("/api/blogs/:id", verifyToken, async (req, res) => {
+    try {
+        const id = parseId(req.params.id);
+        const objectId = toObjectId(id);
+        const user = req.user;
+        if (!objectId) {
+            res.status(400).json({ success: false, message: "Invalid blog ID." });
+            return;
+        }
+        const db = await getDb();
+        const col = db.collection("blogs");
+        const existing = await col.findOne({ _id: objectId });
+        if (!existing) {
+            res.status(404).json({ success: false, message: "Blog not found." });
+            return;
+        }
+        if (user.role !== "admin" && existing.authorId !== toIdString(user._id)) {
+            res.status(403).json({ success: false, message: "You can only update your own blogs." });
+            return;
+        }
+        const { title, content, excerpt, tags, coverImage, status } = req.body;
+        const updates = { updatedAt: new Date() };
+        if (title !== undefined) {
+            if (typeof title !== "string" || title.trim().length < 3) {
+                res.status(400).json({ success: false, message: "Title must be at least 3 characters." });
+                return;
+            }
+            updates.title = title.trim();
+            // Regenerate slug if title changed
+            if (title.trim() !== existing.title) {
+                let baseSlug = generateSlug(title.trim());
+                let slug = baseSlug;
+                let suffix = 1;
+                while (await col.findOne({ slug, _id: { $ne: objectId } })) {
+                    slug = `${baseSlug}-${suffix}`;
+                    suffix++;
+                }
+                updates.slug = slug;
+            }
+        }
+        if (content !== undefined) {
+            if (typeof content !== "string" || stripHtml(content).length < 10) {
+                res.status(400).json({ success: false, message: "Content must be at least 10 characters." });
+                return;
+            }
+            updates.content = content.trim();
+            updates.readingTime = calculateReadingTime(content);
+        }
+        if (excerpt !== undefined)
+            updates.excerpt = String(excerpt).trim().slice(0, 300);
+        if (coverImage !== undefined)
+            updates.coverImage = coverImage || null;
+        if (tags !== undefined && Array.isArray(tags)) {
+            updates.tags = tags.map((t) => String(t).trim().toLowerCase()).filter(Boolean).slice(0, 10);
+        }
+        if (status !== undefined && ["published", "draft"].includes(String(status))) {
+            updates.status = status;
+        }
+        await col.updateOne({ _id: objectId }, { $set: updates });
+        const updated = await col.findOne({ _id: objectId });
+        res.status(200).json({
+            success: true,
+            message: "Blog updated successfully.",
+            data: buildBlogResponse(updated),
+        });
+    }
+    catch (error) {
+        console.error("[BLOGS] Update error:", error);
+        res.status(500).json({ success: false, message: "Failed to update blog." });
+    }
+});
+// DELETE /api/blogs/:id — soft delete (owner or admin)
+app.delete("/api/blogs/:id", verifyToken, async (req, res) => {
+    try {
+        const id = parseId(req.params.id);
+        const objectId = toObjectId(id);
+        const user = req.user;
+        if (!objectId) {
+            res.status(400).json({ success: false, message: "Invalid blog ID." });
+            return;
+        }
+        const db = await getDb();
+        const col = db.collection("blogs");
+        const existing = await col.findOne({ _id: objectId });
+        if (!existing) {
+            res.status(404).json({ success: false, message: "Blog not found." });
+            return;
+        }
+        if (user.role !== "admin" && existing.authorId !== toIdString(user._id)) {
+            res.status(403).json({ success: false, message: "You can only delete your own blogs." });
+            return;
+        }
+        await col.deleteOne({ _id: objectId });
+        res.status(200).json({ success: true, message: "Blog deleted successfully." });
+    }
+    catch (error) {
+        console.error("[BLOGS] Delete error:", error);
+        res.status(500).json({ success: false, message: "Failed to delete blog." });
+    }
+});
+// ============================================================
+// ADMIN BLOG ROUTES
+// ============================================================
+// GET /api/admin/blogs — list all blogs (admin only)
+app.get("/api/admin/blogs", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const db = await getDb();
+        const col = db.collection("blogs");
+        const { page, limit, skip } = getPagination(req.query, 50, 20);
+        const filter = {};
+        if (req.query.status && ["published", "draft"].includes(String(req.query.status))) {
+            filter.status = String(req.query.status);
+        }
+        if (req.query.featured === "true")
+            filter.isFeatured = true;
+        if (req.query.featured === "false")
+            filter.isFeatured = false;
+        if (req.query.search) {
+            const term = String(req.query.search).trim().slice(0, 100);
+            if (term) {
+                filter.$or = [
+                    { title: { $regex: escapeRegex(term), $options: "i" } },
+                    { authorName: { $regex: escapeRegex(term), $options: "i" } },
+                ];
+            }
+        }
+        const [blogs, total] = await Promise.all([
+            col.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+            col.countDocuments(filter),
+        ]);
+        res.status(200).json({
+            success: true,
+            data: {
+                blogs: blogs.map(buildBlogResponse),
+                pagination: buildPaginationResponse(total, page, limit),
+            },
+        });
+    }
+    catch (error) {
+        console.error("[ADMIN BLOGS] List error:", error);
+        res.status(500).json({ success: false, message: "Failed to fetch blogs." });
+    }
+});
+// PUT /api/admin/blogs/:id/feature — toggle featured status
+app.put("/api/admin/blogs/:id/feature", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const id = parseId(req.params.id);
+        const objectId = toObjectId(id);
+        if (!objectId) {
+            res.status(400).json({ success: false, message: "Invalid blog ID." });
+            return;
+        }
+        const db = await getDb();
+        const col = db.collection("blogs");
+        const blog = await col.findOne({ _id: objectId });
+        if (!blog) {
+            res.status(404).json({ success: false, message: "Blog not found." });
+            return;
+        }
+        const newFeatured = !blog.isFeatured;
+        await col.updateOne({ _id: objectId }, { $set: { isFeatured: newFeatured, updatedAt: new Date() } });
+        res.status(200).json({
+            success: true,
+            message: `Blog ${newFeatured ? "featured" : "unfeatured"} successfully.`,
+            data: { isFeatured: newFeatured },
+        });
+    }
+    catch (error) {
+        console.error("[ADMIN BLOGS] Feature toggle error:", error);
+        res.status(500).json({ success: false, message: "Failed to update blog." });
+    }
+});
+// DELETE /api/admin/blogs/:id — admin can delete any blog
+app.delete("/api/admin/blogs/:id", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const id = parseId(req.params.id);
+        const objectId = toObjectId(id);
+        if (!objectId) {
+            res.status(400).json({ success: false, message: "Invalid blog ID." });
+            return;
+        }
+        const db = await getDb();
+        const col = db.collection("blogs");
+        const blog = await col.findOne({ _id: objectId });
+        if (!blog) {
+            res.status(404).json({ success: false, message: "Blog not found." });
+            return;
+        }
+        await col.deleteOne({ _id: objectId });
+        res.status(200).json({ success: true, message: "Blog deleted successfully." });
+    }
+    catch (error) {
+        console.error("[ADMIN BLOGS] Delete error:", error);
+        res.status(500).json({ success: false, message: "Failed to delete blog." });
+    }
+});
+// ============================================================
+// AI BLOG GENERATOR
+// ============================================================
+// POST /api/ai/blog-generator — generate blog content with AI
+app.post("/api/ai/blog-generator", verifyToken, async (req, res) => {
+    try {
+        const groq = getGroq();
+        if (!groq) {
+            res.status(503).json({ success: false, message: "AI service not configured." });
+            return;
+        }
+        const { topic, tone, style, length } = req.body;
+        if (!topic || typeof topic !== "string" || topic.trim().length < 3) {
+            res.status(400).json({ success: false, message: "Topic must be at least 3 characters." });
+            return;
+        }
+        const validTones = ["professional", "casual", "enthusiastic", "informative", "inspirational"];
+        const validStyles = ["blog-post", "listicle", "how-to", "guide", "story"];
+        const validLengths = ["short", "medium", "long"];
+        const selectedTone = validTones.includes(tone) ? tone : "professional";
+        const selectedStyle = validStyles.includes(style) ? style : "blog-post";
+        const selectedLength = validLengths.includes(length) ? length : "medium";
+        const wordCounts = {
+            short: "400-600 words",
+            medium: "800-1200 words",
+            long: "1500-2500 words",
+        };
+        const systemPrompt = `You are an expert travel and hospitality blogger. Write high-quality, engaging blog content for AuraSpace (a travel and property rental platform).
+
+IMPORTANT: Return ONLY valid JSON with this exact structure — no markdown, no code fences, no extra text:
+{
+  "title": "Blog title",
+  "content": "Full blog content in HTML format using <h2>, <h3>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <blockquote> tags",
+  "excerpt": "2-3 sentence summary",
+  "tags": ["relevant", "tags", "lowercase"]
+}
+
+Content rules:
+- Write ${wordCounts[selectedLength]} in a ${selectedTone} tone
+- Use the ${selectedStyle} format
+- Include practical tips, insights, or stories relevant to travel/property rental
+- Use HTML tags for formatting (no <html>, <body>, or <head> tags)
+- Tags should be lowercase, relevant to the topic (3-5 tags)
+- Make it engaging and valuable for readers`;
+        const messages = [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: `Write a ${selectedLength} ${selectedStyle} blog about: ${topic.trim()}` },
+        ];
+        const models = [AI_MODEL, ...AI_MODEL_FALLBACKS];
+        let completion = null;
+        for (const model of models) {
+            try {
+                completion = await groq.chat.completions.create({
+                    messages,
+                    model,
+                    temperature: 0.7,
+                });
+                break;
+            }
+            catch (groqError) {
+                if (groqError?.status === 429 || groqError?.message?.includes("rate limit"))
+                    continue;
+                throw groqError;
+            }
+        }
+        if (!completion) {
+            res.status(429).json({ success: false, message: "AI service is experiencing high demand. Please try again in a few minutes." });
+            return;
+        }
+        const raw = completion.choices[0]?.message?.content?.trim() || "";
+        if (!raw) {
+            res.status(500).json({ success: false, message: "AI returned an empty response." });
+            return;
+        }
+        // Parse JSON from AI response (strip markdown fences if present)
+        let parsed;
+        try {
+            const cleaned = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+            parsed = JSON.parse(cleaned);
+        }
+        catch {
+            res.status(500).json({ success: false, message: "AI returned invalid content. Please try again." });
+            return;
+        }
+        if (!parsed.title || !parsed.content) {
+            res.status(500).json({ success: false, message: "AI response missing required fields." });
+            return;
+        }
+        res.status(200).json({
+            success: true,
+            data: {
+                title: String(parsed.title),
+                content: String(parsed.content),
+                excerpt: String(parsed.excerpt || "").slice(0, 300),
+                tags: Array.isArray(parsed.tags) ? parsed.tags.slice(0, 5) : [],
+            },
+        });
+    }
+    catch (error) {
+        console.error("[AI Blog Generator] Error:", error);
+        res.status(500).json({ success: false, message: error.message || "Failed to generate blog content." });
     }
 });
 // ============================================================
