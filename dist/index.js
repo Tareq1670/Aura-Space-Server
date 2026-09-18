@@ -57,8 +57,13 @@ app.use(express_1.default.json({ limit: "10mb" }));
 app.use(express_1.default.urlencoded({ extended: true, limit: "10mb" }));
 // Local file storage for image uploads (legacy — kept for static serving)
 const UPLOAD_DIR = path_1.default.join(__dirname, "..", "uploads");
-if (!fs_1.default.existsSync(UPLOAD_DIR)) {
-    fs_1.default.mkdirSync(UPLOAD_DIR, { recursive: true });
+try {
+    if (!fs_1.default.existsSync(UPLOAD_DIR)) {
+        fs_1.default.mkdirSync(UPLOAD_DIR, { recursive: true });
+    }
+}
+catch {
+    // Vercel serverless: filesystem is read-only except /tmp — ignore
 }
 app.use("/uploads", express_1.default.static(UPLOAD_DIR));
 const uri = process.env.MONGODB_URI || "";
